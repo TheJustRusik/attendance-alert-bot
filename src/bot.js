@@ -184,6 +184,20 @@ bot.command('cancel', async (ctx) => {
   await clearState(ctx.from.id);
   await showMenu(ctx);
 });
+bot.command('admin', async (ctx) => {
+  await clearState(ctx.from.id);
+  if (!isAdmin(ctx.state.user)) {
+    return ctx.reply('⛔ Команда доступна только администраторам.');
+  }
+  await renderAdmin(ctx);
+});
+bot.command('users', async (ctx) => {
+  await clearState(ctx.from.id);
+  if (!isAdmin(ctx.state.user)) {
+    return ctx.reply('⛔ Команда доступна только администраторам.');
+  }
+  await renderUsers(ctx, 0);
+});
 
 act(/^menu$/, async (ctx) => {
   await clearState(ctx.from.id);
@@ -368,12 +382,71 @@ act(/^create$/, async (ctx) => {
 });
 
 // ---------- админ-панель ----------
+const USERS_PAGE = 10;
+
+function formatUsersTable(users) {
+  if (!users.length) return 'Пользователей пока нет.';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const fmtDate = (d) => {
+    if (!d) return '--.--.--';
+    const dt = new Date(d);
+    if (isNaN(dt.getTime())) return '--.--.--';
+    return `${pad2(dt.getDate())}.${pad2(dt.getMonth() + 1)}.${String(dt.getFullYear()).slice(-2)}`;
+  };
+
+  const truncate = (str, len) => {
+    const s = String(str ?? '');
+    return s.length > len ? s.slice(0, len - 1) + '…' : s.padEnd(len);
+  };
+
+  const header =
+    'ID          Пользователь  Роль  Дата    \n' +
+    '----------- ------------- ----- --------';
+
+  const rows = users.map((u) => {
+    const id = truncate(u.id, 11);
+    const name = truncate(displayName(u), 13);
+    const role = (u.role === 'moderator' ? 'moder' : u.role).padEnd(5);
+    const date = fmtDate(u.created_at).padEnd(8);
+    return `${id} ${name} ${role} ${date}`;
+  });
+
+  return `<pre>${esc([header, ...rows].join('\n'))}</pre>`;
+}
+
+async function renderUsers(ctx, page = 0) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const total = await db.countUsers();
+  const totalPages = Math.max(1, Math.ceil(total / USERS_PAGE));
+  const currentPage = Math.min(Math.max(0, page), totalPages - 1);
+  const users = await db.listUsers(USERS_PAGE, currentPage * USERS_PAGE);
+
+  const table = formatUsersTable(users);
+  const text =
+    `👥 <b>Пользователи в системе</b>\n` +
+    `Всего: <b>${total}</b> · Стр. <b>${currentPage + 1}</b> из <b>${totalPages}</b>\n\n` +
+    table;
+
+  const kb = [];
+  const nav = [];
+  if (currentPage > 0) nav.push(btn('◀️', `users:${currentPage - 1}`));
+  if (totalPages > 1) nav.push(btn(`${currentPage + 1} / ${totalPages}`, 'noop'));
+  if (currentPage + 1 < totalPages) nav.push(btn('▶️', `users:${currentPage + 1}`));
+  if (nav.length) kb.push(nav);
+
+  kb.push([btn('🔄 Обновить', `users:${currentPage}`)], [btn('⬅️ В админку', 'admin'), btn('🏠 Меню', 'menu')]);
+
+  await show(ctx, text, Markup.inlineKeyboard(kb));
+}
+
 async function renderAdmin(ctx, note = '') {
   if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
   await show(
     ctx,
     `👑 <b>Админ-панель</b>${note ? `\n\n${note}` : ''}`,
     Markup.inlineKeyboard([
+      [btn('👥 Пользователи', 'users:0')],
       [btn('🛡 Модераторы', 'mods:0'), btn('➕ Назначить', 'addmod')],
       [btn('📊 Статистика', 'stats')],
       [btn('🏠 Меню', 'menu')],
@@ -382,6 +455,7 @@ async function renderAdmin(ctx, note = '') {
 }
 
 act(/^admin$/, (ctx) => renderAdmin(ctx));
+act(/^users:(\d+)$/, (ctx) => renderUsers(ctx, Number(ctx.match[1])));
 
 act(/^stats$/, async (ctx) => {
   if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');

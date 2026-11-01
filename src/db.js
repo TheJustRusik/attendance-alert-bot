@@ -84,6 +84,21 @@ export async function listModerators(limit, offset) {
   return rows;
 }
 
+export async function countUsers() {
+  const { rows } = await q(`SELECT count(*) AS c FROM users`);
+  return Number(rows[0]?.c ?? 0);
+}
+
+export async function listUsers(limit, offset) {
+  const { rows } = await q(
+    `SELECT * FROM users
+      ORDER BY CASE role WHEN 'admin' THEN 1 WHEN 'moderator' THEN 2 ELSE 3 END, created_at ASC
+      LIMIT $1 OFFSET $2`,
+    [limit, offset],
+  );
+  return rows;
+}
+
 export async function stats() {
   const { rows } = await q(`
     SELECT
