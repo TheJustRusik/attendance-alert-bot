@@ -352,6 +352,40 @@ function formatCourseTitle(course) {
 }
 
 /**
+ * Navigates within the /student SPA without full page reload when possible,
+ * preserving the in-memory OIDC access token and avoiding redirect back to /student/ dashboard.
+ */
+async function navigateStudentSpa(page, targetPath) {
+  const isInStudentSpa = await page
+    .evaluate(() => location.pathname === '/student' || location.pathname.startsWith('/student/'))
+    .catch(() => false);
+
+  if (isInStudentSpa) {
+    const clickedLink = await page
+      .evaluate((p) => {
+        const link = document.querySelector(`a[href="${p}"]`);
+        if (link) {
+          link.click();
+          return true;
+        }
+        history.pushState({}, '', p);
+        window.dispatchEvent(new PopStateEvent('popstate'));
+        return true;
+      }, targetPath)
+      .catch(() => false);
+
+    if (clickedLink) {
+      await sleep(500);
+      return;
+    }
+  }
+
+  await page
+    .goto(`${config.uninetUrl}${targetPath}`, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    .catch(() => {});
+}
+
+/**
  * Logs into Uninet via Playwright using ephemeral credentials (never stored),
  * navigates to /student/course-materials, and returns the student's courses.
  */
@@ -524,33 +558,63 @@ export async function loginAndFetchCourses(userId, login, password, notify) {
       throw new UserFacingError('Превышено время ожидания входа в Uninet (проверьте логин/пароль или доступность портала).');
     }
 
-    // Open student course materials list
-    if (!page.url().includes('/course-materials')) {
-      await page
-        .goto(`${config.uninetUrl}/student/course-materials`, { waitUntil: 'domcontentloaded', timeout: 30000 })
-        .catch(() => {});
+    // Wait for RootRedirectPage (/ -> /student/) and student SPA silent OIDC init to finish
+    const studentReadyDeadline = Date.now() + 20000;
+    while (Date.now() < studentReadyDeadline) {
+      if (session.stopped) throw new UserFacingError('Сессия отменена.');
+      if (capturedApiCourses) break;
+
+      const state = await page
+        .evaluate(() => ({
+          path: location.pathname,
+          hasCourseLink: !!document.querySelector('a[href="/student/course-materials"]'),
+          hasMainHeading: !!document.querySelector('h1'),
+        }))
+        .catch(() => ({ path: '', hasCourseLink: false, hasMainHeading: false }));
+
+      if (
+        (state.path === '/student' || state.path.startsWith('/student/')) &&
+        (state.hasCourseLink || state.hasMainHeading)
+      ) {
+        break;
+      }
+      await sleep(400);
+    }
+
+    // Navigate inside the /student SPA to /student/course-materials (preserves in-memory OIDC token)
+    if (!capturedApiCourses) {
+      await navigateStudentSpa(page, '/student/course-materials');
     }
 
     const listDeadline = Date.now() + 20000;
     while (Date.now() < listDeadline && !capturedApiCourses) {
       if (session.stopped) throw new UserFacingError('Сессия отменена.');
-      await sleep(400);
+      const curPath = await page.evaluate(() => location.pathname).catch(() => '');
+      if (curPath === '/student' || curPath === '/student/') {
+        // Student callback redirected back to dashboard; push to course-materials again
+        await navigateStudentSpa(page, '/student/course-materials');
+      }
+      await sleep(500);
     }
 
-    // Fallback DOM scraping if API response wasn't intercepted (e.g. cached)
+    // Fallback DOM scraping ONLY if actually on /course-materials (never on /student dashboard!)
     let courses = capturedApiCourses;
     if (!courses) {
       courses = await page
         .evaluate(() => {
+          if (!location.pathname.includes('/course-materials')) return null;
           const cards = Array.from(document.querySelectorAll('.grid h3'));
-          return cards.map((h3, idx) => {
-            const box = h3.parentElement;
-            const code = box?.querySelector('.font-mono')?.textContent?.trim() || '';
-            const title = h3.textContent?.trim() || `Курс ${idx + 1}`;
-            return { id: null, domIndex: idx, code, title, instructor: '' };
-          });
+          return cards
+            .map((h3, idx) => {
+              const box = h3.parentElement;
+              const code = box?.querySelector('.font-mono')?.textContent?.trim() || '';
+              const title = h3.textContent?.trim() || '';
+              if (!code && !title) return null;
+              return { id: null, domIndex: idx, code, title: title || `Курс ${idx + 1}`, instructor: '' };
+            })
+            .filter(Boolean);
         })
-        .catch(() => []);
+        .catch(() => null);
     }
 
     if (!courses || courses.length === 0) {
@@ -667,17 +731,11 @@ async function watchSingleCourse(session, course, indexLabel, stopKeyboard) {
     stopKeyboard,
   );
 
-  // Navigate to the course page
+  // Navigate to the course page via SPA navigation to preserve in-memory OIDC token
   if (course.id) {
-    await page.goto(`${config.uninetUrl}/student/course-materials/${course.id}`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
+    await navigateStudentSpa(page, `/student/course-materials/${course.id}`);
   } else {
-    await page.goto(`${config.uninetUrl}/student/course-materials`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
+    await navigateStudentSpa(page, '/student/course-materials');
     await page.waitForSelector('.grid h3', { timeout: 15000 });
     await page.evaluate((idx) => {
       const h3 = document.querySelectorAll('.grid h3')[idx];
