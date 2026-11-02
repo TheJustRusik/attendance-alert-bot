@@ -2,6 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { config } from './config.js';
 import * as db from './db.js';
 import * as aw from './autowatcher.js';
+import * as aa from './attendance.js';
 import { redis, setState, getState, clearState, acquireCooldown, cooldownLeft, releaseCooldown } from './redis.js';
 
 export const bot = new Telegraf(config.botToken);
@@ -87,16 +88,26 @@ function pager(prefix, page, hasNext, suffix = '') {
 // ---------- меню ----------
 async function resetDialog(uid) {
   aw.cancelAuthPrompt(uid);
+  aa.cancelAuthPrompt(uid);
   await clearState(uid);
 }
 
-function mainMenu(u) {
+async function buildMainMenu(u) {
   const activeAw = aw.getSession(u.id);
   const awTitle = activeAw
     ? '🎬 Автопросмотр лекций в портале Uninet (🟢)'
     : '🎬 Автопросмотр лекций в портале Uninet';
+
+  const aaCfg = await db.getAutoAttendance(u.id);
+  const aaTitle = aaCfg
+    ? aaCfg.enabled
+      ? '🤖 Авто-аттенданс в PGE (🟢 Вкл)'
+      : '🤖 Авто-аттенданс в PGE (⏸ Пауза)'
+    : '🤖 Авто-аттенданс в PGE';
+
   const rows = [
     [btn('🔍 Все пулы', 'pools:0'), btn('📚 Мои подписки', 'my:0')],
+    [btn(aaTitle, 'autoattend')],
     [btn(awTitle, 'autowatch')],
   ];
   if (isStaff(u)) rows.push([btn('🛠 Мои пулы', 'own:0'), btn('➕ Создать пул', 'create')]);
@@ -109,10 +120,10 @@ async function showMenu(ctx) {
   await show(
     ctx,
     `👋 Привет, <b>${esc(u.first_name || displayName(u))}</b>!\n\n` +
-      `Я сообщу одногруппникам, что <b>берут аттенданс</b> 🔔\n` +
+      `Я сообщу одногруппникам, что <b>берут аттенданс</b> 🔔, и могу автоматически отметить тебя на <b>pge.kbtu.kz</b> 🤖\n` +
       `Вступай в пул нужного предмета — и уведомления придут тебе.\n\n` +
       `Твоя роль: ${ROLE_LABEL[u.role]}`,
-    mainMenu(u),
+    await buildMainMenu(u),
   );
 }
 
@@ -149,6 +160,7 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
   }
   const member = await db.isMember(poolId, u.id);
   const owner = owns(u, pool);
+  const aaCfg = member ? await db.getAutoAttendance(u.id) : null;
 
   const rows = [];
   if (member) {
@@ -162,10 +174,18 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
   }
   rows.push([btn('⬅️ Назад', `${kind}:0`), btn('🏠 Меню', 'menu')]);
 
+  const aaLine = member
+    ? aaCfg
+      ? aaCfg.enabled
+        ? '\n🤖 Авто-аттенданс: <b>включён</b> 🟢'
+        : '\n🤖 Авто-аттенданс: <i>на паузе</i> ⏸'
+      : '\n🤖 Авто-аттенданс: <i>не настроен</i> (/autoattend)'
+    : '';
+
   const status = member
-    ? owner
-      ? '🛡 Это ваш пул — уведомления без ограничений'
-      : `✅ Вы в пуле · уведомления раз в ${fmtWait(config.notifyCooldownSec)}`
+    ? (owner
+        ? '🛡 Это ваш пул — уведомления без ограничений'
+        : `✅ Вы в пуле · уведомления раз в ${fmtWait(config.notifyCooldownSec)}`) + aaLine
     : 'Вы пока не в этом пуле';
 
   await show(
@@ -194,6 +214,10 @@ bot.command('menu', async (ctx) => {
 bot.command('cancel', async (ctx) => {
   await resetDialog(ctx.from.id);
   await showMenu(ctx);
+});
+bot.command('autoattend', async (ctx) => {
+  await resetDialog(ctx.from.id);
+  await renderAutoAttend(ctx);
 });
 bot.command('autowatch', async (ctx) => {
   await resetDialog(ctx.from.id);
@@ -286,20 +310,58 @@ act(/^send:(\d+):(pools|my|own)$/, async (ctx) => {
   await ctx.answerCbQuery('📨 Отправляю…').catch(() => {});
 
   const ids = await db.memberIds(id, u.id);
-  const text =
+  const allPoolUserIds = [u.id, ...ids];
+  const autoRows = await db.getAutoAttendanceForUsers(allPoolUserIds);
+  const autoMap = new Map(autoRows.map((r) => [r.user_id, r]));
+
+  const baseHeader =
     `🔔 <b>Берут аттенданс!</b>\n\n` +
     `📚 Пул: <b>${esc(pool.name)}</b>\n` +
-    `👤 От: ${esc(displayName(u))}\n\n` +
-    `Скорее отмечайся! 🏃‍♂️💨`;
-  const { sent, failed } = await broadcast(ids, text);
+    `👤 От: ${esc(displayName(u))}\n\n`;
+
+  let sent = 0;
+  let failed = 0;
+  for (const memberId of ids) {
+    const memberCfg = autoMap.get(memberId);
+    let msgText = baseHeader + `Скорее отмечайся! 🏃‍♂️💨`;
+    let msgExtra = Markup.inlineKeyboard([[btn('🤖 Авто-аттенданс', 'autoattend')]]);
+
+    if (memberCfg?.enabled) {
+      msgText =
+        baseHeader +
+        `🤖 <i>Авто-аттенданс запущен — захожу на pge.kbtu.kz, чтобы отметить вас…</i>`;
+      msgExtra = {};
+    } else if (memberCfg && !memberCfg.enabled) {
+      msgText = baseHeader + `Скорее отмечайся! 🏃‍♂️💨\n<i>(Авто-аттенданс сейчас на паузе)</i>`;
+      msgExtra = Markup.inlineKeyboard([[btn('⚡ Отметиться сейчас через бота', 'aa_run_now')]]);
+    }
+
+    (await send(memberId, msgText, msgExtra)) ? sent++ : failed++;
+    await sleep(40);
+  }
 
   if (!unlimited && ids.length > 0 && sent === 0) await releaseCooldown(id, u.id); // ничего не ушло — не штрафуем
+
+  // Запускаем фоновый авто-аттенданс для всех участников пула с включённой опцией
+  const enabledConfigs = autoRows.filter((r) => r.enabled);
+  for (const cfg of enabledConfigs) {
+    triggerAutoAttendanceForUser(cfg.user_id, cfg.enc_credentials, {
+      poolName: pool.name,
+      retryIfEmpty: true,
+    });
+  }
+
+  const autoNote = enabledConfigs.length
+    ? `\n🤖 Авто-аттенданс запущен для: ${enabledConfigs.length} чел.`
+    : '';
 
   await renderPool(
     ctx,
     id,
     kind,
-    `✅ Уведомление отправлено: ${sent} 👥` + (failed ? `\n⚠️ Не доставлено: ${failed} (заблокировали бота)` : ''),
+    `✅ Уведомление отправлено: ${sent} 👥` +
+      (failed ? `\n⚠️ Не доставлено: ${failed} (заблокировали бота)` : '') +
+      autoNote,
   );
 });
 
@@ -389,12 +451,230 @@ act(/^delok:(\d+):(pools|my|own)$/, async (ctx) => {
 act(/^create$/, async (ctx) => {
   if (!isStaff(ctx.state.user)) return alert(ctx, '⛔ Создавать пулы могут только модераторы');
   aw.cancelAuthPrompt(ctx.from.id);
+  aa.cancelAuthPrompt(ctx.from.id);
   await setState(ctx.from.id, { type: 'create_pool' });
   await show(
     ctx,
     '✏️ <b>Новый пул</b>\n\nОтправьте название предмета одним сообщением (до 40 символов).\nНапример: <i>Unity Game Engine</i>',
     Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
   );
+});
+
+// ---------- авто-аттенданс PGE ----------
+function fmtDateTime(d) {
+  if (!d) return '—';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return '—';
+  const pad2 = (n) => String(n).padStart(2, '0');
+  return `${pad2(dt.getDate())}.${pad2(dt.getMonth() + 1)} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+}
+
+function triggerAutoAttendanceForUser(
+  userId,
+  encCredentials,
+  { poolName = null, retryIfEmpty = false, editMessageId = null } = {},
+) {
+  (async () => {
+    const res = await aa.runCheckInForUser(userId, encCredentials, { retryIfEmpty });
+    const poolLine = poolName ? `\n📚 Пул: <b>${esc(poolName)}</b>` : '';
+
+    let statusSummary = '';
+    let replyHtml = '';
+    let replyKb = Markup.inlineKeyboard([
+      [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+    ]);
+
+    if (res.status === 'checked') {
+      statusSummary = `✅ Отмечено: ${res.checkedCount}`;
+      const discList = res.disciplines?.length
+        ? `\n📖 Дисциплины:\n` + res.disciplines.map((d) => `• <i>${esc(d)}</i>`).join('\n')
+        : '';
+      replyHtml =
+        `✅ <b>Авто-аттенданс успешно отмечен!</b>` +
+        poolLine +
+        `\n✔️ Нажато активных Check in: <b>${res.checkedCount}</b>` +
+        discList;
+    } else if (res.status === 'none') {
+      statusSummary = 'ℹ️ Активных Check in не было';
+      replyHtml =
+        `ℹ️ <b>Авто-аттенданс проверил pge.kbtu.kz</b>` +
+        poolLine +
+        `\n\nАктивных кнопок <code>Check in</code> сейчас нет ` +
+        `<i>(возможно, вы уже отмечены или преподаватель ещё не открыл / уже закрыл отметку)</i>.`;
+      replyKb = Markup.inlineKeyboard([
+        [btn('🔄 Проверить ещё раз', 'aa_run_now')],
+        [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+      ]);
+    } else if (res.status === 'invalid_credentials' || res.status === 'decryption_error') {
+      statusSummary = '❌ Ошибка входа (пауза)';
+      await db.setAutoAttendanceEnabled(userId, false).catch(() => {});
+      replyHtml =
+        `❌ <b>Авто-аттенданс не смог войти в pge.kbtu.kz</b>` +
+        poolLine +
+        `\nПричина: ${esc(res.error || 'Неверный логин или пароль.')}\n\n` +
+        `⏸ Авто-аттенданс временно поставлен на паузу — обновите логин/пароль в настройках!`;
+      replyKb = Markup.inlineKeyboard([
+        [btn('🔑 Обновить данные PGE', 'aa_setup')],
+        [btn('🏠 Меню', 'menu')],
+      ]);
+    } else {
+      statusSummary = '⚠️ Ошибка сети/портала';
+      replyHtml =
+        `⚠️ <b>Авто-аттенданс: сбой при обращении к pge.kbtu.kz</b>` +
+        poolLine +
+        `\n<i>${esc(res.error || 'Портал временно недоступен.')}</i>\n\n` +
+        `Проверьте отметку вручную или повторите попытку:`;
+      replyKb = Markup.inlineKeyboard([
+        [btn('🔄 Повторить сейчас', 'aa_run_now')],
+        [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+      ]);
+    }
+
+    await db.updateAutoAttendanceRun(userId, statusSummary).catch(() => {});
+
+    if (editMessageId) {
+      await bot.telegram
+        .editMessageText(userId, editMessageId, undefined, replyHtml, {
+          parse_mode: 'HTML',
+          ...replyKb,
+        })
+        .catch(() => send(userId, replyHtml, replyKb));
+    } else {
+      await send(userId, replyHtml, replyKb);
+    }
+  })().catch((err) => {
+    console.error(`[AutoAttendance] Unhandled error for user ${userId}:`, err.message);
+  });
+}
+
+async function renderAutoAttend(ctx, note = '') {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+
+  const cfg = await db.getAutoAttendance(u.id);
+  if (!cfg) {
+    return show(
+      ctx,
+      `🤖 <b>Авто-аттенданс в портале PGE (pge.kbtu.kz)</b>\n\n` +
+        `Бот может <b>автоматически</b> заходить за вас на <code>pge.kbtu.kz/RegistrationOnline</code> ` +
+        `и нажимать все активные кнопки <code>Check in</code> каждый раз, когда в любом вашем пуле приходит алерт «берут аттенданс» 🔔\n\n` +
+        `🔒 <i>Логин и пароль шифруются алгоритмом AES-256-GCM, сообщения с ними мгновенно удаляются из чата, а удалить привязку можно в любой момент.</i>` +
+        (note ? `\n\n${note}` : ''),
+      Markup.inlineKeyboard([
+        [btn('🔑 Подключить аккаунт PGE', 'aa_setup')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  }
+
+  const running = aa.isUserJobRunning(u.id);
+  const stateLabel = cfg.enabled
+    ? '🟢 <b>Включён</b> (срабатывает автоматически при алерте в ваших пулах)'
+    : '⏸ <b>На паузе</b> (автоматический вход временно отключён)';
+
+  const lastRunBlock = cfg.last_run_at
+    ? `\n🕒 Последний запуск: <code>${esc(fmtDateTime(cfg.last_run_at))}</code> · ${esc(cfg.last_status || '—')}`
+    : '';
+
+  const toggleBtn = cfg.enabled
+    ? btn('⏸ Поставить на паузу', 'aa_toggle')
+    : btn('▶️ Включить обратно', 'aa_toggle');
+
+  await show(
+    ctx,
+    `🤖 <b>Авто-аттенданс (pge.kbtu.kz)</b>\n\n` +
+      `Статус: ${stateLabel}\n` +
+      `👤 Аккаунт PGE: <code>${esc(cfg.login_mask)}</code>` +
+      lastRunBlock +
+      (running ? '\n\n🔄 <i>Сейчас выполняется проверка на pge.kbtu.kz…</i>' : '') +
+      (note ? `\n\n${note}` : ''),
+    Markup.inlineKeyboard([
+      [btn('⚡ Проверить и отметиться сейчас', 'aa_run_now')],
+      [toggleBtn],
+      [btn('🔑 Сменить логин/пароль', 'aa_setup'), btn('🗑 Удалить данные', 'aa_del_ask')],
+      [btn('🏠 Меню', 'menu')],
+    ]),
+  );
+}
+
+act(/^autoattend$/, (ctx) => renderAutoAttend(ctx));
+
+act(/^aa_setup$/, async (ctx) => {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+  aa.beginAuthPrompt(u.id);
+  await show(
+    ctx,
+    `🔑 <b>Привязка аккаунта pge.kbtu.kz</b>\n\n` +
+      `Отправьте ваш <b>логин</b> от портала PGE / WSP (например, <code>i_ivanov</code>).\n\n` +
+      `🔒 <i>Сообщение с логином сразу удалится из чата. Данные хранятся только в зашифрованном виде (AES-256-GCM).</i>`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+});
+
+act(/^aa_toggle$/, async (ctx) => {
+  const u = ctx.state.user;
+  const cfg = await db.getAutoAttendance(u.id);
+  if (!cfg) return renderAutoAttend(ctx);
+  const updated = await db.setAutoAttendanceEnabled(u.id, !cfg.enabled);
+  await ctx
+    .answerCbQuery(updated?.enabled ? '🟢 Авто-аттенданс включён' : '⏸ Авто-аттенданс поставлен на паузу')
+    .catch(() => {});
+  await renderAutoAttend(ctx);
+});
+
+act(/^aa_run_now$/, async (ctx) => {
+  const u = ctx.state.user;
+  const cfg = await db.getAutoAttendance(u.id);
+  if (!cfg) return renderAutoAttend(ctx);
+  if (aa.isUserJobRunning(u.id)) {
+    return alert(ctx, '⏳ Проверка на pge.kbtu.kz уже выполняется, подождите несколько секунд!');
+  }
+
+  await ctx.answerCbQuery('🚀 Запускаю отметку на pge.kbtu.kz…').catch(() => {});
+  const waitingText =
+    `🔄 <b>Подключаюсь к pge.kbtu.kz…</b>\n` +
+    `Вхожу в аккаунт <code>${esc(cfg.login_mask)}</code> и нажимаю все активные кнопки <code>Check in</code> <i>(обычно 5–10 сек)</i>.`;
+  const waitingKb = Markup.inlineKeyboard([[btn('🏠 Меню', 'menu')]]);
+
+  let editMsgId = null;
+  if (ctx.callbackQuery?.message?.message_id) {
+    editMsgId = ctx.callbackQuery.message.message_id;
+    await ctx
+      .editMessageText(waitingText, { parse_mode: 'HTML', ...waitingKb })
+      .catch(async () => {
+        const m = await ctx.reply(waitingText, { parse_mode: 'HTML', ...waitingKb });
+        editMsgId = m.message_id;
+      });
+  } else {
+    const m = await ctx.reply(waitingText, { parse_mode: 'HTML', ...waitingKb });
+    editMsgId = m.message_id;
+  }
+
+  triggerAutoAttendanceForUser(u.id, cfg.enc_credentials, {
+    retryIfEmpty: false,
+    editMessageId: editMsgId,
+  });
+});
+
+act(/^aa_del_ask$/, async (ctx) => {
+  const cfg = await db.getAutoAttendance(ctx.state.user.id);
+  if (!cfg) return renderAutoAttend(ctx);
+  await show(
+    ctx,
+    `🗑 <b>Удалить данные авто-аттенданса?</b>\n\n` +
+      `Зашифрованный логин и пароль (<code>${esc(cfg.login_mask)}</code>) будут полностью удалены из базы данных.`,
+    Markup.inlineKeyboard([
+      [btn('🗑 Да, удалить навсегда', 'aa_del_ok')],
+      [btn('❌ Отмена', 'autoattend')],
+    ]),
+  );
+});
+
+act(/^aa_del_ok$/, async (ctx) => {
+  await db.deleteAutoAttendance(ctx.state.user.id);
+  await ctx.answerCbQuery('🗑 Данные авто-аттенданса удалены').catch(() => {});
+  await renderAutoAttend(ctx, '✅ Ваши учётные данные полностью удалены из базы.');
 });
 
 // ---------- автопросмотр лекций Uninet ----------
@@ -508,7 +788,7 @@ act(/^aw_stop$/, async (ctx) => {
     stopped
       ? '⏹ <b>Автопросмотр остановлен.</b>\nБраузер закрыт, сессия полностью очищена.'
       : 'ℹ️ Активной сессии автопросмотра нет.',
-    mainMenu(u),
+    await buildMainMenu(u),
   );
 });
 
@@ -599,6 +879,7 @@ act(/^stats$/, async (ctx) => {
       `🛡 Модераторов: ${s.moderators}\n` +
       `📚 Пулов: ${s.pools}\n` +
       `🔗 Подписок: ${s.memberships}\n` +
+      `🤖 Авто-аттенданс PGE: ${s.auto_attendance_enabled} вкл / ${s.auto_attendance_total} всего (в работе: ${aa.activeJobsCount()})\n` +
       `🎬 Сессий Uninet: ${aw.activeSessionCount()} / ${config.maxWatchSessions}`,
     Markup.inlineKeyboard([[btn('⬅️ Назад', 'admin')]]),
   );
@@ -636,6 +917,7 @@ act(/^demote:(\d+)$/, async (ctx) => {
 act(/^addmod$/, async (ctx) => {
   if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
   aw.cancelAuthPrompt(ctx.from.id);
+  aa.cancelAuthPrompt(ctx.from.id);
   await setState(ctx.from.id, { type: 'add_mod' });
   await show(
     ctx,
@@ -724,6 +1006,94 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  // Ввод логина / пароля pge.kbtu.kz для Авто-аттенданса (промпт в RAM, хранение в PostgreSQL AES-256-GCM)
+  const aaStep = aa.getAuthPromptStep(u.id);
+  if (aaStep === 'login') {
+    await ctx.deleteMessage().catch(() => {});
+    const normalized = aa.normalizeLogin(text);
+    if (normalized.length < 2 || normalized.length > 100 || /\s/.test(normalized)) {
+      return ctx.reply('⚠️ Введите корректный логин от pge.kbtu.kz (без пробелов) или нажмите «Отмена».', {
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      });
+    }
+    aa.setPromptLogin(u.id, normalized);
+    return ctx.reply(
+      `✅ Логин принят <i>(сообщение удалено из чата)</i>.\n\n` +
+        `🔑 Теперь отправьте <b>пароль</b> от портала <code>pge.kbtu.kz</code>:\n` +
+        `🔒 <i>Сообщение с паролем также будет сразу удалено, а перед сохранением бот проверит вход.</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      },
+    );
+  }
+
+  if (aaStep === 'password') {
+    await ctx.deleteMessage().catch(() => {});
+    const login = aa.consumePromptLogin(u.id);
+    const password = rawText.trim();
+    if (!login || !password) {
+      return showMenu(ctx);
+    }
+
+    const statusMsg = await ctx.reply(
+      `🔄 Пароль получен <i>(сообщение удалено из чата)</i>.\n` +
+        `Проверяю вход на <code>pge.kbtu.kz</code>… <i>(обычно 5–10 сек)</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('🏠 Меню', 'menu')]]),
+      },
+    );
+
+    (async () => {
+      try {
+        const verified = await aa.verifyPgeCredentials(login, password);
+        const encrypted = aa.encryptCredentials(verified.normalizedLogin, password);
+        await db.saveAutoAttendance(u.id, verified.loginMask, encrypted);
+
+        const activeHint =
+          verified.activeCount > 0
+            ? `\n\n🔥 <b>Прямо сейчас на портале открыто активных аттендансов: ${verified.activeCount}!</b> Нажмите кнопку ниже, чтобы сразу отметиться:`
+            : '';
+
+        const okRows = [];
+        if (verified.activeCount > 0) {
+          okRows.push([btn(`⚡ Отметиться прямо сейчас (${verified.activeCount})`, 'aa_run_now')]);
+        }
+        okRows.push([btn('⚙️ Настройки авто-аттенданса', 'autoattend')], [btn('🏠 Меню', 'menu')]);
+        const okKb = Markup.inlineKeyboard(okRows);
+
+        const okText =
+          `✅ <b>Аккаунт pge.kbtu.kz успешно подключён!</b>\n\n` +
+          `👤 Аккаунт: <code>${esc(verified.loginMask)}</code>\n` +
+          `🟢 Авто-аттенданс <b>включён</b> — теперь при алерте в любом вашем пуле бот автоматически отметит все активные дисциплины.` +
+          activeHint;
+
+        await bot.telegram
+          .editMessageText(u.id, statusMsg.message_id, undefined, okText, {
+            parse_mode: 'HTML',
+            ...okKb,
+          })
+          .catch(() => send(u.id, okText, okKb));
+      } catch (err) {
+        const msg =
+          err instanceof aa.AttendanceError ? err.message : 'Не удалось проверить вход на pge.kbtu.kz.';
+        const errText = `❌ <b>${esc(msg)}</b>\n<i>Данные не сохранены.</i>`;
+        const errKb = Markup.inlineKeyboard([
+          [btn('🔁 Ввести заново', 'aa_setup')],
+          [btn('🏠 Меню', 'menu')],
+        ]);
+        await bot.telegram
+          .editMessageText(u.id, statusMsg.message_id, undefined, errText, {
+            parse_mode: 'HTML',
+            ...errKb,
+          })
+          .catch(() => send(u.id, errText, errKb));
+      }
+    })();
+    return;
+  }
+
   const state = await getState(u.id);
   if (!state) return showMenu(ctx);
 
@@ -785,6 +1155,7 @@ bot.catch((err, ctx) => {
 
 export async function shutdown() {
   await aw.stopAllSessions().catch(() => {});
+  await aa.shutdownAttendance().catch(() => {});
   await redis.quit().catch(() => {});
   await db.pgPool.end().catch(() => {});
 }

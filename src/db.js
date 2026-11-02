@@ -30,6 +30,15 @@ export async function initDb() {
       PRIMARY KEY (pool_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS pool_members_user_idx ON pool_members (user_id);
+    CREATE TABLE IF NOT EXISTS auto_attendance (
+      user_id         BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      login_mask      TEXT NOT NULL,
+      enc_credentials TEXT NOT NULL,
+      enabled         BOOLEAN NOT NULL DEFAULT true,
+      last_run_at     TIMESTAMPTZ,
+      last_status     TEXT,
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
 }
 
@@ -106,7 +115,9 @@ export async function stats() {
       (SELECT count(*) FROM users WHERE role = 'moderator') AS moderators,
       (SELECT count(*) FROM users WHERE role = 'admin') AS admins,
       (SELECT count(*) FROM pools) AS pools,
-      (SELECT count(*) FROM pool_members) AS memberships
+      (SELECT count(*) FROM pool_members) AS memberships,
+      (SELECT count(*) FROM auto_attendance) AS auto_attendance_total,
+      (SELECT count(*) FROM auto_attendance WHERE enabled = true) AS auto_attendance_enabled
   `);
   return rows[0];
 }
@@ -206,6 +217,62 @@ export async function listMembers(poolId, limit, offset) {
       ORDER BY m.joined_at
       LIMIT $2 OFFSET $3`,
     [poolId, limit, offset],
+  );
+  return rows;
+}
+
+// ---------- auto_attendance ----------
+export async function saveAutoAttendance(userId, loginMask, encCredentials) {
+  const { rows } = await q(
+    `INSERT INTO auto_attendance (user_id, login_mask, enc_credentials, enabled, updated_at)
+     VALUES ($1, $2, $3, true, now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       login_mask = EXCLUDED.login_mask,
+       enc_credentials = EXCLUDED.enc_credentials,
+       enabled = true,
+       updated_at = now()
+     RETURNING *`,
+    [userId, loginMask, encCredentials],
+  );
+  return rows[0];
+}
+
+export async function getAutoAttendance(userId) {
+  const { rows } = await q('SELECT * FROM auto_attendance WHERE user_id = $1', [userId]);
+  return rows[0] || null;
+}
+
+export async function setAutoAttendanceEnabled(userId, enabled) {
+  const { rows } = await q(
+    `UPDATE auto_attendance SET enabled = $2, updated_at = now()
+      WHERE user_id = $1
+      RETURNING *`,
+    [userId, Boolean(enabled)],
+  );
+  return rows[0] || null;
+}
+
+export async function updateAutoAttendanceRun(userId, lastStatus) {
+  await q(
+    `UPDATE auto_attendance
+        SET last_run_at = now(), last_status = $2, updated_at = now()
+      WHERE user_id = $1`,
+    [userId, lastStatus],
+  );
+}
+
+export async function deleteAutoAttendance(userId) {
+  const r = await q('DELETE FROM auto_attendance WHERE user_id = $1', [userId]);
+  return r.rowCount > 0;
+}
+
+export async function getAutoAttendanceForUsers(userIds) {
+  if (!userIds || userIds.length === 0) return [];
+  const { rows } = await q(
+    `SELECT user_id, login_mask, enc_credentials, enabled
+       FROM auto_attendance
+      WHERE user_id = ANY($1::bigint[])`,
+    [userIds],
   );
   return rows;
 }
