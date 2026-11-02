@@ -1,6 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import { config } from './config.js';
 import * as db from './db.js';
+import * as aw from './autowatcher.js';
 import { redis, setState, getState, clearState, acquireCooldown, cooldownLeft, releaseCooldown } from './redis.js';
 
 export const bot = new Telegraf(config.botToken);
@@ -84,9 +85,19 @@ function pager(prefix, page, hasNext, suffix = '') {
 }
 
 // ---------- меню ----------
+async function resetDialog(uid) {
+  aw.cancelAuthPrompt(uid);
+  await clearState(uid);
+}
+
 function mainMenu(u) {
+  const activeAw = aw.getSession(u.id);
+  const awTitle = activeAw
+    ? '🎬 Автопросмотр лекций в портале Uninet (🟢)'
+    : '🎬 Автопросмотр лекций в портале Uninet';
   const rows = [
     [btn('🔍 Все пулы', 'pools:0'), btn('📚 Мои подписки', 'my:0')],
+    [btn(awTitle, 'autowatch')],
   ];
   if (isStaff(u)) rows.push([btn('🛠 Мои пулы', 'own:0'), btn('➕ Создать пул', 'create')]);
   if (isAdmin(u)) rows.push([btn('👑 Админ-панель', 'admin')]);
@@ -173,26 +184,30 @@ bot.use(async (ctx, next) => {
 
 // ---------- команды ----------
 bot.start(async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
 bot.command('menu', async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
 bot.command('cancel', async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
+bot.command('autowatch', async (ctx) => {
+  await resetDialog(ctx.from.id);
+  await renderAutoWatch(ctx);
+});
 bot.command('admin', async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   if (!isAdmin(ctx.state.user)) {
     return ctx.reply('⛔ Команда доступна только администраторам.');
   }
   await renderAdmin(ctx);
 });
 bot.command('users', async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   if (!isAdmin(ctx.state.user)) {
     return ctx.reply('⛔ Команда доступна только администраторам.');
   }
@@ -200,11 +215,11 @@ bot.command('users', async (ctx) => {
 });
 
 act(/^menu$/, async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
 act(/^cancel$/, async (ctx) => {
-  await clearState(ctx.from.id);
+  await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
 
@@ -373,11 +388,127 @@ act(/^delok:(\d+):(pools|my|own)$/, async (ctx) => {
 // ---------- создание пула ----------
 act(/^create$/, async (ctx) => {
   if (!isStaff(ctx.state.user)) return alert(ctx, '⛔ Создавать пулы могут только модераторы');
+  aw.cancelAuthPrompt(ctx.from.id);
   await setState(ctx.from.id, { type: 'create_pool' });
   await show(
     ctx,
     '✏️ <b>Новый пул</b>\n\nОтправьте название предмета одним сообщением (до 40 символов).\nНапример: <i>Unity Game Engine</i>',
     Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+});
+
+// ---------- автопросмотр лекций Uninet ----------
+function buildCoursePickerKeyboard(courses) {
+  const short = (s, max = 46) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
+  const rows = courses.map((c, idx) => {
+    const label = c.code ? `${c.code} · ${c.title}` : c.title;
+    return [btn(`📖 ${short(label)}`, `aw_pick:${idx}`)];
+  });
+  if (courses.length > 1) {
+    rows.push([btn(`🚀 Все курсы подряд (${courses.length})`, 'aw_pick:all')]);
+  }
+  rows.push([btn('⏹ Отмена (закрыть браузер)', 'aw_stop')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function renderAutoWatch(ctx) {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+
+  const session = aw.getSession(u.id);
+  if (session) {
+    if (session.status === 'logging_in') {
+      return show(
+        ctx,
+        '🔄 <b>Выполняется вход в портал Uninet…</b>\nПодождите несколько секунд.',
+        Markup.inlineKeyboard([[btn('⏹ Отмена', 'aw_stop')], [btn('🏠 Меню', 'menu')]]),
+      );
+    }
+    if (session.status === 'selecting_course') {
+      return show(
+        ctx,
+        `🎬 <b>Автопросмотр лекций Uninet</b>\n\n` +
+          `Найдено курсов: <b>${session.courses.length}</b>.\n` +
+          `Выберите предмет для автопросмотра (или запустите все по очереди):`,
+        buildCoursePickerKeyboard(session.courses),
+      );
+    }
+    const elapsedSec = Math.floor((Date.now() - session.startedAt) / 1000);
+    return show(
+      ctx,
+      `🟢 <b>Автопросмотр лекций Uninet активен</b>\n\n` +
+        `📖 Курс: <b>${esc(session.currentCourse || '—')}</b>\n` +
+        `⏱ В работе: ${fmtWait(elapsedSec)}\n` +
+        `📝 Последний лог: <code>${esc(session.lastLog || 'ожидание…')}</code>`,
+      Markup.inlineKeyboard([
+        [btn('🔄 Обновить', 'autowatch'), btn('⏹ Остановить', 'aw_stop')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  }
+
+  const check = aw.canStartNewSession(u.id);
+  if (!check.ok) {
+    return show(
+      ctx,
+      `⏳ <b>Свободных браузеров сейчас нет</b>\n\nЗапущено сессий: ${aw.activeSessionCount()} из ${config.maxWatchSessions}.\nПопробуйте немного позже.`,
+      Markup.inlineKeyboard([[btn('🔄 Проверить снова', 'autowatch')], [btn('🏠 Меню', 'menu')]]),
+    );
+  }
+
+  aw.beginAuthPrompt(u.id);
+  await show(
+    ctx,
+    `🎬 <b>Автопросмотр лекций в портале Uninet</b>\n\n` +
+      `Отправьте ваш <b>логин</b> от портала Uninet (например, <code>i_ivanov</code>).\n\n` +
+      `🔒 <i>Бот не хранит логин и пароль (ни в БД, ни на диске), а сообщения с ними сразу удаляются из чата.</i>`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+}
+
+act(/^autowatch$/, (ctx) => renderAutoWatch(ctx));
+
+act(/^aw_pick:(all|\d+)$/, async (ctx) => {
+  const u = ctx.state.user;
+  const pick = ctx.match[1];
+  const stopKb = Markup.inlineKeyboard([
+    [btn('📊 Статус', 'autowatch'), btn('⏹ Остановить автопросмотр', 'aw_stop')],
+  ]);
+  const doneKb = Markup.inlineKeyboard([[btn('🏠 Меню', 'menu')]]);
+
+  try {
+    aw.startWatchingSelection(u.id, pick, stopKb, doneKb);
+    await show(
+      ctx,
+      `🚀 <b>Автопросмотр запущен!</b>\n\n` +
+        `Браузер открывает лекции и запускает скрипт <code>AutoWatcher</code>.\n` +
+        `Логи прогресса будут приходить в этот чат.`,
+      Markup.inlineKeyboard([
+        [btn('📊 Статус', 'autowatch'), btn('⏹ Остановить', 'aw_stop')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  } catch (err) {
+    const msg = err instanceof aw.UserFacingError ? err.message : 'Не удалось запустить просмотр.';
+    await show(
+      ctx,
+      `⚠️ ${esc(msg)}`,
+      Markup.inlineKeyboard([[btn('🔁 Запустить заново', 'autowatch')], [btn('🏠 Меню', 'menu')]]),
+    );
+  }
+});
+
+act(/^aw_stop$/, async (ctx) => {
+  const u = ctx.state.user;
+  aw.cancelAuthPrompt(u.id);
+  const stopped = await aw.stopSession(u.id);
+  await ctx.answerCbQuery(stopped ? '⏹ Автопросмотр остановлен' : 'Сессия уже завершена').catch(() => {});
+  await show(
+    ctx,
+    stopped
+      ? '⏹ <b>Автопросмотр остановлен.</b>\nБраузер закрыт, сессия полностью очищена.'
+      : 'ℹ️ Активной сессии автопросмотра нет.',
+    mainMenu(u),
   );
 });
 
@@ -462,7 +593,13 @@ act(/^stats$/, async (ctx) => {
   const s = await db.stats();
   await show(
     ctx,
-    `📊 <b>Статистика</b>\n\n👤 Пользователей: ${s.users}\n👑 Админов: ${s.admins}\n🛡 Модераторов: ${s.moderators}\n📚 Пулов: ${s.pools}\n🔗 Подписок: ${s.memberships}`,
+    `📊 <b>Статистика</b>\n\n` +
+      `👤 Пользователей: ${s.users}\n` +
+      `👑 Админов: ${s.admins}\n` +
+      `🛡 Модераторов: ${s.moderators}\n` +
+      `📚 Пулов: ${s.pools}\n` +
+      `🔗 Подписок: ${s.memberships}\n` +
+      `🎬 Сессий Uninet: ${aw.activeSessionCount()} / ${config.maxWatchSessions}`,
     Markup.inlineKeyboard([[btn('⬅️ Назад', 'admin')]]),
   );
 });
@@ -498,6 +635,7 @@ act(/^demote:(\d+)$/, async (ctx) => {
 
 act(/^addmod$/, async (ctx) => {
   if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  aw.cancelAuthPrompt(ctx.from.id);
   await setState(ctx.from.id, { type: 'add_mod' });
   await show(
     ctx,
@@ -509,10 +647,85 @@ act(/^addmod$/, async (ctx) => {
 // ---------- текстовый ввод ----------
 bot.on('text', async (ctx) => {
   const u = ctx.state.user;
+  const rawText = ctx.message.text;
+  const text = rawText.trim();
+
+  // Ввод логина / пароля Uninet (только в оперативной памяти, без БД и Redis)
+  const awStep = aw.getAuthPromptStep(u.id);
+  if (awStep === 'login') {
+    await ctx.deleteMessage().catch(() => {});
+    if (text.length < 2 || text.length > 100 || /\s/.test(text)) {
+      return ctx.reply('⚠️ Введите корректный логин от портала Uninet (без пробелов) или нажмите «Отмена».', {
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      });
+    }
+    aw.setPromptLogin(u.id, text);
+    return ctx.reply(
+      `✅ Логин принят <i>(сообщение удалено из чата)</i>.\n\n` +
+        `🔑 Теперь отправьте <b>пароль</b> от портала Uninet:\n` +
+        `🔒 <i>Сообщение с паролем также будет сразу удалено, и данные нигде не сохранятся.</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      },
+    );
+  }
+
+  if (awStep === 'password') {
+    await ctx.deleteMessage().catch(() => {});
+    const login = aw.consumePromptLogin(u.id);
+    const password = rawText.trim();
+    if (!login || !password) {
+      return showMenu(ctx);
+    }
+
+    const statusMsg = await ctx.reply(
+      `🔄 Пароль получен <i>(сообщение удалено из чата)</i>.\n` +
+        `Запускаю браузер и вхожу в портал Uninet… <i>(обычно 10–20 сек)</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('⏹ Отмена', 'aw_stop')]]),
+      },
+    );
+
+    // Не блокируем очередь обновлений Telegraf пока Playwright логинится
+    (async () => {
+      try {
+        const courses = await aw.loginAndFetchCourses(u.id, login, password, (html, extra) =>
+          send(u.id, html, extra),
+        );
+        const pickerText =
+          `✅ <b>Вход в Uninet выполнен!</b>\n\n` +
+          `Найдено курсов: <b>${courses.length}</b>.\n` +
+          `Выберите предмет для автопросмотра лекций (или запустите все подряд):`;
+        const kb = buildCoursePickerKeyboard(courses);
+
+        await bot.telegram
+          .editMessageText(u.id, statusMsg.message_id, undefined, pickerText, {
+            parse_mode: 'HTML',
+            ...kb,
+          })
+          .catch(() => send(u.id, pickerText, kb));
+      } catch (err) {
+        const msg = err instanceof aw.UserFacingError ? err.message : 'Ошибка при входе в портал Uninet.';
+        const errText = `❌ <b>${esc(msg)}</b>`;
+        const errKb = Markup.inlineKeyboard([
+          [btn('🔁 Попробовать снова', 'autowatch')],
+          [btn('🏠 Меню', 'menu')],
+        ]);
+        await bot.telegram
+          .editMessageText(u.id, statusMsg.message_id, undefined, errText, {
+            parse_mode: 'HTML',
+            ...errKb,
+          })
+          .catch(() => send(u.id, errText, errKb));
+      }
+    })();
+    return;
+  }
+
   const state = await getState(u.id);
   if (!state) return showMenu(ctx);
-
-  const text = ctx.message.text.trim();
 
   if (state.type === 'create_pool') {
     if (!isStaff(u)) return clearState(u.id);
@@ -571,6 +784,7 @@ bot.catch((err, ctx) => {
 });
 
 export async function shutdown() {
+  await aw.stopAllSessions().catch(() => {});
   await redis.quit().catch(() => {});
   await db.pgPool.end().catch(() => {});
 }
