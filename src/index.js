@@ -10,6 +10,7 @@ if (await ensureEnvAdmins(config.adminIds)) {
 
 await bot.telegram.setMyCommands([
   { command: 'menu', description: '🏠 Главное меню' },
+  { command: 'attestation', description: '📊 Оценки за аттестацию Uninet' },
   { command: 'autoattend', description: '🤖 Авто-аттенданс PGE' },
   { command: 'autowatch', description: '🎬 Автопросмотр лекций Uninet' },
   { command: 'cancel', description: '❌ Отмена действия' },

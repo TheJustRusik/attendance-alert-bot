@@ -3,6 +3,7 @@ import { config } from './config.js';
 import * as db from './db.js';
 import * as aw from './autowatcher.js';
 import * as aa from './attendance.js';
+import * as uninet from './uninetApi.js';
 import { redis, setState, getState, clearState, acquireCooldown, cooldownLeft, releaseCooldown } from './redis.js';
 
 export const bot = new Telegraf(config.botToken);
@@ -89,6 +90,7 @@ function pager(prefix, page, hasNext, suffix = '') {
 async function resetDialog(uid) {
   aw.cancelAuthPrompt(uid);
   aa.cancelAuthPrompt(uid);
+  uninet.cancelAuthPrompt(uid);
   await clearState(uid);
 }
 
@@ -107,6 +109,7 @@ async function buildMainMenu(u) {
 
   const rows = [
     [btn('🔍 Все пулы', 'pools:0'), btn('📚 Мои подписки', 'my:0')],
+    [btn('📊 Оценки (Аттестация)', 'attestation')],
     [btn(aaTitle, 'autoattend')],
     [btn(awTitle, 'autowatch')],
   ];
@@ -222,6 +225,10 @@ bot.command('autoattend', async (ctx) => {
 bot.command('autowatch', async (ctx) => {
   await resetDialog(ctx.from.id);
   await renderAutoWatch(ctx);
+});
+bot.command(['attestation', 'grades', 'att'], async (ctx) => {
+  await resetDialog(ctx.from.id);
+  await renderAttestation(ctx);
 });
 bot.command('admin', async (ctx) => {
   await resetDialog(ctx.from.id);
@@ -792,6 +799,389 @@ act(/^aw_stop$/, async (ctx) => {
   );
 });
 
+// ---------- оценки за аттестацию Uninet ----------
+const PERIOD_NAMES = {
+  1: 'Осенний (Fall)',
+  2: 'Весенний (Spring)',
+  3: 'Летний (Summer)',
+};
+
+const PERIOD_SHORT = {
+  1: '🍂 Осень',
+  2: '🌱 Весна',
+  3: '☀️ Лето',
+};
+
+function formatSubjectName(s) {
+  if (!s) return '—';
+  if (typeof s === 'string') return s;
+  if (typeof s === 'object') {
+    return s.ru || s.kz || s.en || s.name || 'Дисциплина';
+  }
+  return String(s);
+}
+
+function formatCourseBlock(rec) {
+  const code = esc(rec.subjectCode || '').trim();
+  const name = esc(formatSubjectName(rec.subjectName || rec.courseName || rec.disciplineName)).trim();
+  const header = code && name ? `<b>${code}</b> · ${name}` : `<b>${code || name || 'Дисциплина'}</b>`;
+
+  const lines = [header];
+
+  const g1 = rec.grade1 != null ? String(rec.grade1) : '—';
+  const g2 = rec.grade2 != null ? String(rec.grade2) : '—';
+  const fin = rec.finalGrade != null ? String(rec.finalGrade) : '—';
+  const letter = rec.letterGrade ? String(rec.letterGrade).trim() : '';
+  const total = rec.digitGrade ?? rec.totalGrade ?? rec.total ?? null;
+
+  lines.push(`  ├ 1-я аттестация: <b>${g1}</b>`);
+  lines.push(`  ├ 2-я аттестация: <b>${g2}</b>`);
+
+  let sumAtt = null;
+  if (typeof rec.grade1 === 'number' && typeof rec.grade2 === 'number') {
+    sumAtt = rec.grade1 + rec.grade2;
+    lines.push(`  ├ Допуск (РД): <b>${sumAtt}</b> / 60`);
+  }
+
+  lines.push(`  ├ Экзамен (Финал): <b>${fin}</b>`);
+
+  let finalSummary = '';
+  if (total != null && letter) {
+    finalSummary = `<b>${total}</b> (${letter})`;
+  } else if (letter) {
+    finalSummary = `<b>${letter}</b>`;
+  } else if (total != null) {
+    finalSummary = `<b>${total}</b>`;
+  } else if (sumAtt != null && typeof rec.finalGrade === 'number') {
+    finalSummary = `<b>${sumAtt + rec.finalGrade}</b>`;
+  } else {
+    finalSummary = '—';
+  }
+
+  lines.push(`  └ Итог: ${finalSummary}`);
+  return lines.join('\n');
+}
+
+async function getOrFetchValidUninetToken(userId) {
+  let token = uninet.getCachedToken(userId);
+  if (token) return token;
+
+  const refreshToken = uninet.getCachedRefreshToken(userId);
+  if (refreshToken) {
+    const refreshed = await uninet.refreshAccessToken(refreshToken).catch(() => null);
+    if (refreshed) {
+      const login = uninet.getCachedToken(userId)?.login || '';
+      uninet.setCachedToken(userId, { ...refreshed, login });
+      return { ...refreshed, login };
+    }
+  }
+
+  // Проверяем сохранённые учётные данные KBTU в auto_attendance
+  const cfg = await db.getAutoAttendance(userId);
+  if (cfg) {
+    try {
+      const { login, password } = aa.decryptCredentials(cfg.enc_credentials);
+      const tokenData = await uninet.loginWithCredentials(login, password);
+      uninet.setCachedToken(userId, { ...tokenData, login });
+      return { ...tokenData, login };
+    } catch (err) {
+      console.warn(`[Attestation] Auto-login with saved credentials failed for user ${userId}:`, err.message);
+      return null;
+    }
+  }
+
+  return null;
+}
+
+async function showAttestationGrades(
+  ctx,
+  userId,
+  tokenData,
+  { year = '', period = '' } = {},
+  editMessageId = null,
+) {
+  try {
+    let semesters = [];
+    try {
+      semesters = await uninet.fetchSemesters(tokenData.accessToken);
+    } catch (e) {
+      if (e instanceof uninet.UninetAuthError) throw e;
+    }
+
+    let selectedYear = year;
+    let selectedPeriod = period;
+
+    if (!selectedYear || !selectedPeriod) {
+      const currentSem = semesters.find((s) => s.current) || semesters[0];
+      if (currentSem) {
+        selectedYear = selectedYear || currentSem.yearName;
+        selectedPeriod = selectedPeriod || String(currentSem.periodId);
+      }
+    }
+
+    const data = await uninet.fetchAttestation(tokenData.accessToken, {
+      year: selectedYear,
+      period: selectedPeriod,
+    });
+
+    const semesterList = Array.isArray(data)
+      ? data
+      : data?.semesters || (data?.records ? [data] : []);
+    const records = semesterList.flatMap((s) => s.records || []);
+
+    const periodLabel =
+      PERIOD_NAMES[selectedPeriod] || (selectedPeriod ? `Период ${selectedPeriod}` : 'Текущий семестр');
+    const semTitle = selectedYear ? `${selectedYear} · ${periodLabel}` : periodLabel;
+    const loginTitle = tokenData.login ? `\n👤 Студент: <code>${esc(tokenData.login)}</code>` : '';
+
+    let text = `📊 <b>Оценки за аттестацию (Uninet)</b>\n📅 Семестр: <b>${esc(semTitle)}</b>${loginTitle}\n\n`;
+
+    if (!records.length) {
+      text += `ℹ️ <i>За выбранный семестр записей об аттестации не найдено (возможно, семестр ещё не начался или оценки ещё не внесены).</i>`;
+    } else {
+      const courseBlocks = records.map(formatCourseBlock);
+      text += courseBlocks.join('\n\n');
+    }
+
+    const kbRows = [];
+
+    // Кнопки выбора семестров
+    if (semesters.length > 1) {
+      if (semesters.length <= 3) {
+        const row = semesters.map((s) => {
+          const isSelected =
+            String(s.yearName) === String(selectedYear) && String(s.periodId) === String(selectedPeriod);
+          const icon = PERIOD_SHORT[s.periodId] || '📅';
+          const shortYear = s.yearName.replace(/^\d{2}(\d{2})-\d{2}(\d{2})$/, '$1/$2');
+          const label = `${isSelected ? '✅ ' : ''}${icon} ${shortYear}`;
+          return btn(label, `att_view:${s.yearName}:${s.periodId}`);
+        });
+        kbRows.push(row);
+      } else {
+        kbRows.push([btn('📅 Выбрать другой семестр', 'att_sem_pick')]);
+      }
+    }
+
+    const refreshBtn = btn('🔄 Обновить', `att_view:${selectedYear || ''}:${selectedPeriod || ''}`);
+
+    const cfg = await db.getAutoAttendance(userId);
+    const hasSavedCreds = Boolean(cfg);
+    const canSaveTemp = Boolean(uninet.peekTempCreds(userId));
+
+    if (!hasSavedCreds && canSaveTemp) {
+      kbRows.push([refreshBtn, btn('💾 Сохранить в боте', 'att_save_creds')]);
+    } else if (hasSavedCreds) {
+      kbRows.push([refreshBtn, btn('🚪 Сменить аккаунт', 'att_logout')]);
+    } else {
+      kbRows.push([refreshBtn, btn('🚪 Выйти', 'att_logout')]);
+    }
+
+    kbRows.push([btn('🏠 Меню', 'menu')]);
+
+    const keyboard = Markup.inlineKeyboard(kbRows);
+
+    if (editMessageId) {
+      await bot.telegram
+        .editMessageText(userId, editMessageId, undefined, text, {
+          parse_mode: 'HTML',
+          ...keyboard,
+        })
+        .catch(() => send(userId, text, keyboard));
+    } else if (ctx.callbackQuery) {
+      await show(ctx, text, keyboard);
+    } else {
+      await ctx.reply(text, { parse_mode: 'HTML', ...keyboard });
+    }
+  } catch (err) {
+    if (err instanceof uninet.UninetAuthError) {
+      uninet.clearCachedToken(userId);
+      const reText = '⚠️ <b>Сессия авторизации истекла.</b> Пожалуйста, войдите снова:';
+      const reKb = Markup.inlineKeyboard([
+        [btn('🔑 Войти в Uninet', 'att_setup')],
+        [btn('🏠 Меню', 'menu')],
+      ]);
+      if (editMessageId) {
+        await bot.telegram
+          .editMessageText(userId, editMessageId, undefined, reText, {
+            parse_mode: 'HTML',
+            ...reKb,
+          })
+          .catch(() => send(userId, reText, reKb));
+      } else {
+        await show(ctx, reText, reKb);
+      }
+      return;
+    }
+
+    const msg = err instanceof uninet.UninetError ? err.message : 'Сбой при загрузке оценок из Uninet.';
+    const errText = `❌ <b>${esc(msg)}</b>`;
+    const errKb = Markup.inlineKeyboard([
+      [btn('🔄 Повторить', `att_view:${year || ''}:${period || ''}`)],
+      [btn('🏠 Меню', 'menu')],
+    ]);
+    if (editMessageId) {
+      await bot.telegram
+        .editMessageText(userId, editMessageId, undefined, errText, {
+          parse_mode: 'HTML',
+          ...errKb,
+        })
+        .catch(() => send(userId, errText, errKb));
+    } else {
+      await show(ctx, errText, errKb);
+    }
+  }
+}
+
+async function renderAttestation(ctx, { year = '', period = '', forcePrompt = false } = {}) {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+
+  if (forcePrompt) {
+    return show(
+      ctx,
+      `📊 <b>Оценки за аттестацию (Uninet)</b>\n\n` +
+        `Отправьте логин и пароль от портала Uninet / KBTU, чтобы запросить оценки через официальное API.\n\n` +
+        `⚡ <b>Без запуска браузера:</b> запрос выполняется напрямую к API портала, минимизируя нагрузку на сервер.\n` +
+        `🔒 <i>Пароль удаляется из чата сразу после получения.</i>`,
+      Markup.inlineKeyboard([
+        [btn('🔑 Ввести логин и пароль', 'att_setup')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  }
+
+  const tokenData = await getOrFetchValidUninetToken(u.id);
+
+  if (!tokenData) {
+    const cfg = await db.getAutoAttendance(u.id);
+    if (cfg) {
+      return show(
+        ctx,
+        `📊 <b>Оценки за аттестацию (Uninet)</b>\n\n` +
+          `Найден сохранённый аккаунт KBTU: <code>${esc(cfg.login_mask)}</code>.\n` +
+          `Не удалось автоматически войти (возможно, пароль был изменён). Обновите данные:`,
+        Markup.inlineKeyboard([
+          [btn('🔑 Обновить логин/пароль', 'att_setup')],
+          [btn('🏠 Меню', 'menu')],
+        ]),
+      );
+    }
+
+    return show(
+      ctx,
+      `📊 <b>Оценки за аттестацию (Uninet)</b>\n\n` +
+        `Для просмотра оценок войдите под своей учётной записью KBTU (например, <code>i_ivanov</code>).\n\n` +
+        `⚡ <b>Быстро и легко:</b> запрос идёт напрямую через официальное API портала без запуска браузера Playwright.\n` +
+        `🔒 <i>Пароль удаляется из чата сразу после получения.</i>`,
+      Markup.inlineKeyboard([
+        [btn('🔑 Войти в Uninet', 'att_setup')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  }
+
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery('🔄 Загружаю оценки…').catch(() => {});
+  }
+
+  await showAttestationGrades(ctx, u.id, tokenData, { year, period });
+}
+
+act(/^attestation$/, (ctx) => renderAttestation(ctx));
+
+act(/^att_setup$/, async (ctx) => {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+  uninet.beginAuthPrompt(u.id);
+  await show(
+    ctx,
+    `🔑 <b>Вход в Uninet</b>\n\n` +
+      `Отправьте ваш <b>логин</b> от портала Uninet / KBTU (например, <code>i_ivanov</code>).\n\n` +
+      `🔒 <i>Сообщение с логином сразу удалится из чата.</i>`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+});
+
+act(/^att_view:(.*):(.*)$/, async (ctx) => {
+  const year = ctx.match[1] || '';
+  const period = ctx.match[2] || '';
+  await renderAttestation(ctx, { year, period });
+});
+
+act(/^att_sem_pick$/, async (ctx) => {
+  const u = ctx.state.user;
+  const tokenData = await getOrFetchValidUninetToken(u.id);
+  if (!tokenData) return renderAttestation(ctx);
+
+  const semesters = await uninet.fetchSemesters(tokenData.accessToken);
+  if (!semesters.length) {
+    return alert(ctx, 'Список семестров недоступен');
+  }
+
+  const rows = semesters.map((s) => {
+    const icon = PERIOD_SHORT[s.periodId] || '📅';
+    const curHint = s.current ? ' (текущий)' : '';
+    return [
+      btn(
+        `${icon} ${s.yearName} · ${PERIOD_NAMES[s.periodId] || s.periodId}${curHint}`,
+        `att_view:${s.yearName}:${s.periodId}`,
+      ),
+    ];
+  });
+  rows.push([btn('⬅️ Назад', 'attestation')]);
+
+  await show(
+    ctx,
+    `📅 <b>Выберите семестр для просмотра оценок:</b>`,
+    Markup.inlineKeyboard(rows),
+  );
+});
+
+act(/^att_save_creds$/, async (ctx) => {
+  const u = ctx.state.user;
+  const creds = uninet.consumeTempCreds(u.id);
+  if (!creds) {
+    return alert(ctx, '⚠️ Время сохранения истекло. Введите данные заново.');
+  }
+
+  try {
+    const encrypted = aa.encryptCredentials(creds.login, creds.password);
+    await db.saveAutoAttendance(u.id, aa.maskLogin(creds.login), encrypted);
+    await ctx
+      .answerCbQuery('💾 Аккаунт сохранён! Теперь оценки доступны в 1 клик 🎉', { show_alert: true })
+      .catch(() => {});
+  } catch (err) {
+    console.error(`[Attestation] Failed to save credentials for user ${u.id}:`, err);
+    return alert(ctx, '❌ Не удалось сохранить аккаунт.');
+  }
+
+  await renderAttestation(ctx);
+});
+
+act(/^att_logout$/, async (ctx) => {
+  const u = ctx.state.user;
+  uninet.clearCachedToken(u.id);
+  uninet.cancelAuthPrompt(u.id);
+
+  const cfg = await db.getAutoAttendance(u.id);
+  if (cfg) {
+    await show(
+      ctx,
+      `👤 <b>Управление аккаунтом Uninet / KBTU</b>\n\n` +
+        `Текущий аккаунт: <code>${esc(cfg.login_mask)}</code>\n\n` +
+        `Что вы хотите сделать?`,
+      Markup.inlineKeyboard([
+        [btn('🔑 Войти под другим логином', 'att_setup')],
+        [btn('🗑 Удалить сохранённый аккаунт', 'aa_del_ask')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  } else {
+    await ctx.answerCbQuery('🚪 Вы вышли из сессии').catch(() => {});
+    await renderAttestation(ctx, { forcePrompt: true });
+  }
+});
+
 // ---------- админ-панель ----------
 const USERS_PAGE = 10;
 
@@ -931,6 +1321,71 @@ bot.on('text', async (ctx) => {
   const u = ctx.state.user;
   const rawText = ctx.message.text;
   const text = rawText.trim();
+
+  // Ввод логина / пароля Uninet API для просмотра оценок аттестации (без браузера)
+  const attStep = uninet.getAuthPromptStep(u.id);
+  if (attStep === 'login') {
+    await ctx.deleteMessage().catch(() => {});
+    const normalized = uninet.normalizeLogin(text);
+    if (normalized.length < 2 || normalized.length > 100 || /\s/.test(normalized)) {
+      return ctx.reply('⚠️ Введите корректный логин от портала Uninet (без пробелов) или нажмите «Отмена».', {
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      });
+    }
+    uninet.setPromptLogin(u.id, normalized);
+    return ctx.reply(
+      `✅ Логин принят <i>(сообщение удалено из чата)</i>.\n\n` +
+        `🔑 Теперь отправьте <b>пароль</b> от портала Uninet / KBTU:\n` +
+        `🔒 <i>Сообщение с паролем также будет сразу удалено. Вход выполняется напрямую в API.</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+      },
+    );
+  }
+
+  if (attStep === 'password') {
+    await ctx.deleteMessage().catch(() => {});
+    const login = uninet.consumePromptLogin(u.id);
+    const password = rawText.trim();
+    if (!login || !password) {
+      return showMenu(ctx);
+    }
+
+    const statusMsg = await ctx.reply(
+      `🔄 Пароль получен <i>(сообщение удалено из чата)</i>.\n` +
+        `Подключаюсь к API Uninet… <i>(обычно 1–2 сек)</i>`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('🏠 Меню', 'menu')]]),
+      },
+    );
+
+    (async () => {
+      try {
+        const tokenData = await uninet.loginWithCredentials(login, password);
+        uninet.setCachedToken(u.id, { ...tokenData, login });
+        uninet.setTempCreds(u.id, login, password);
+
+        await showAttestationGrades(ctx, u.id, tokenData, {}, statusMsg.message_id);
+      } catch (err) {
+        const msg =
+          err instanceof uninet.UninetError ? err.message : 'Не удалось выполнить вход в портал Uninet.';
+        const errText = `❌ <b>${esc(msg)}</b>`;
+        const errKb = Markup.inlineKeyboard([
+          [btn('🔁 Попробовать снова', 'att_setup')],
+          [btn('🏠 Меню', 'menu')],
+        ]);
+        await bot.telegram
+          .editMessageText(u.id, statusMsg.message_id, undefined, errText, {
+            parse_mode: 'HTML',
+            ...errKb,
+          })
+          .catch(() => send(u.id, errText, errKb));
+      }
+    })();
+    return;
+  }
 
   // Ввод логина / пароля Uninet (только в оперативной памяти, без БД и Redis)
   const awStep = aw.getAuthPromptStep(u.id);
