@@ -63,14 +63,41 @@ function runKbtuAutoWatcher() {
   }
 
   async function goToWeek(week) {
-    log(`📅 switching to week ${week.n}`);
+    const targetN = typeof week === 'number' ? week : week.n;
+    log(`📅 switching to week ${targetN}`);
     lastNavAt = Date.now();
-    if (week.el) week.el.click(); else closeDropdown();
-    await sleep(1500);
-    if (currentWeek() !== week.n) {
+
+    if (week.el && document.contains(week.el)) {
+      week.el.click();
+    } else {
+      const select = weekSelect();
+      const trigger = select?.parentElement?.querySelector("button[role='combobox']");
+      if (trigger) {
+        if (trigger.getAttribute("aria-expanded") !== "true") {
+          trigger.click();
+          await sleep(400);
+        }
+        const list = document.getElementById(trigger.getAttribute("aria-controls"));
+        const options = list ? Array.from(list.querySelectorAll("[role='option']")) : [];
+        const opt = options.find((o) => {
+          const t = (o.innerText || '').trim();
+          return t.startsWith(`Week ${targetN} `) || t.startsWith(`Week ${targetN}—`) || t.startsWith(`Week ${targetN}\n`);
+        });
+        if (opt) {
+          opt.click();
+        } else {
+          closeDropdown();
+        }
+      }
+    }
+
+    await sleep(2000);
+    if (currentWeek() !== targetN) {
       // Fallback: SPA navigation through the router (no page reload, script keeps running)
       closeDropdown();
-      const path = location.pathname.replace(/(course-materials\/[^/]+\/)\d+/, `$1${week.n}`);
+      const path = /(course-materials\/[^/]+)(?:\/\d+)?/.test(location.pathname)
+        ? location.pathname.replace(/(course-materials\/[^/]+)(?:\/\d+)?/, `$1/${targetN}`)
+        : `/student/course-materials/${targetN}`;
       history.pushState({}, "", path + location.search);
       dispatchEvent(new PopStateEvent("popstate"));
     }
@@ -202,7 +229,8 @@ export function setPromptLogin(userId, login) {
   if (prev?.timer) clearTimeout(prev.timer);
   const timer = setTimeout(() => pendingAuth.delete(userId), AUTH_PROMPT_TTL_MS);
   timer.unref?.();
-  pendingAuth.set(userId, { step: 'password', login, timer });
+  const normalized = String(login || '').trim().replace(/@kbtu\.kz$/i, '');
+  pendingAuth.set(userId, { step: 'password', login: normalized, timer });
 }
 
 export function getAuthPromptStep(userId) {
@@ -254,7 +282,16 @@ async function ensureBrowser() {
     if (config.playwrightExecutablePath) {
       attempts.push(() => chromium.launch({ ...baseOpts, executablePath: config.playwrightExecutablePath }));
     }
-    for (const sysPath of ['/usr/bin/chromium-browser', '/usr/bin/chromium']) {
+    const candidatePaths = [
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/snap/bin/chromium',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    ];
+    for (const sysPath of candidatePaths) {
       if (sysPath !== config.playwrightExecutablePath && fs.existsSync(sysPath)) {
         attempts.push(() => chromium.launch({ ...baseOpts, executablePath: sysPath }));
       }
@@ -389,7 +426,9 @@ async function navigateStudentSpa(page, targetPath) {
  * Logs into Uninet via Playwright using ephemeral credentials (never stored),
  * navigates to /student/course-materials, and returns the student's courses.
  */
-export async function loginAndFetchCourses(userId, login, password, notify) {
+export async function loginAndFetchCourses(userId, rawLogin, rawPassword, notify) {
+  let login = String(rawLogin || '').trim().replace(/@kbtu\.kz$/i, '');
+  let password = String(rawPassword || '').trim();
   if (sessions.has(userId)) {
     throw new UserFacingError('У вас уже запущена активная сессия автопросмотра.');
   }
@@ -707,6 +746,16 @@ function attachConsoleForwarder(page, session) {
       session.enqueueSend(`🖥 <code>[AutoWatcher]</code> ${esc(body)}`);
 
       if (body.includes('All unlocked weeks are done!')) {
+        const lockedMatch = body.match(/Locked:\s*([\d,\s]+)/);
+        const lockedWeeks = lockedMatch ? lockedMatch[1].trim() : '';
+        if (lockedWeeks) {
+          session.enqueueSend(
+            `🎉 <b>Все доступные недели курса уже просмотрены!</b>\n` +
+            `🔒 Недели <code>${esc(lockedWeeks)}</code> ещё закрыты преподавателем на портале.`,
+          );
+        } else {
+          session.enqueueSend(`🎉 <b>Все недели курса полностью просмотрены!</b>`);
+        }
         courseDoneResolver?.('done');
       }
     } catch {}

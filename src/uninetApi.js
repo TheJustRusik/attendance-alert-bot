@@ -9,6 +9,7 @@ export const CLIENT_ID = 'uninet-frontend';
 export const REDIRECT_URI = `${UNINET_BASE_URL}/callback`;
 export const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+export const DEFAULT_ACCEPT_LANGUAGE = 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7';
 
 // ---------- Error classes ----------
 export class UninetError extends Error {
@@ -295,6 +296,7 @@ export async function fetchAttestation(accessToken, { year = '', period = '' } =
         'Authorization': `Bearer ${accessToken}`,
         'User-Agent': USER_AGENT,
         'Accept': 'application/json',
+        'Accept-Language': DEFAULT_ACCEPT_LANGUAGE,
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -335,6 +337,7 @@ export async function fetchSemesters(accessToken) {
         'Authorization': `Bearer ${accessToken}`,
         'User-Agent': USER_AGENT,
         'Accept': 'application/json',
+        'Accept-Language': DEFAULT_ACCEPT_LANGUAGE,
       },
       signal: AbortSignal.timeout(15000),
     });

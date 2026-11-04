@@ -743,6 +743,21 @@ async function renderAutoWatch(ctx) {
     );
   }
 
+  const cfg = await db.getAutoAttendance(u.id);
+  if (cfg) {
+    return show(
+      ctx,
+      `🎬 <b>Автопросмотр лекций в портале Uninet</b>\n\n` +
+        `Найден сохранённый аккаунт KBTU: <code>${esc(cfg.login_mask)}</code>.\n\n` +
+        `Войти под этим аккаунтом или ввести другой логин/пароль?`,
+      Markup.inlineKeyboard([
+        [btn(`▶️ Войти как ${cfg.login_mask}`, 'aw_use_saved')],
+        [btn('🔑 Ввести другой логин/пароль', 'aw_prompt')],
+        [btn('🏠 Меню', 'menu')],
+      ]),
+    );
+  }
+
   aw.beginAuthPrompt(u.id);
   await show(
     ctx,
@@ -754,6 +769,79 @@ async function renderAutoWatch(ctx) {
 }
 
 act(/^autowatch$/, (ctx) => renderAutoWatch(ctx));
+
+act(/^aw_prompt$/, async (ctx) => {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+  aw.beginAuthPrompt(u.id);
+  await show(
+    ctx,
+    `🎬 <b>Автопросмотр лекций в портале Uninet</b>\n\n` +
+      `Отправьте ваш <b>логин</b> от портала Uninet (например, <code>i_ivanov</code>).\n\n` +
+      `🔒 <i>Бот не хранит логин и пароль (ни в БД, ни на диске), а сообщения с ними сразу удаляются из чата.</i>`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+});
+
+act(/^aw_use_saved$/, async (ctx) => {
+  const u = ctx.state.user;
+  await resetDialog(u.id);
+  const cfg = await db.getAutoAttendance(u.id);
+  if (!cfg) return renderAutoWatch(ctx);
+
+  const check = aw.canStartNewSession(u.id);
+  if (!check.ok) {
+    return alert(ctx, '⏳ Свободных браузеров сейчас нет. Попробуйте чуть позже.');
+  }
+
+  let creds;
+  try {
+    creds = aa.decryptCredentials(cfg.enc_credentials);
+  } catch {
+    return alert(ctx, '❌ Не удалось расшифровать сохранённые данные.');
+  }
+
+  const statusMsg = await ctx.reply(
+    `🔄 Запускаю браузер и вхожу в Uninet под <code>${esc(cfg.login_mask)}</code>… <i>(обычно 10–20 сек)</i>`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([[btn('⏹ Отмена', 'aw_stop')]]),
+    },
+  );
+
+  (async () => {
+    try {
+      const courses = await aw.loginAndFetchCourses(u.id, creds.login, creds.password, (html, extra) =>
+        send(u.id, html, extra),
+      );
+      const pickerText =
+        `✅ <b>Вход в Uninet выполнен!</b>\n\n` +
+        `Найдено курсов: <b>${courses.length}</b>.\n` +
+        `Выберите предмет для автопросмотра лекций (или запустите все подряд):`;
+      const kb = buildCoursePickerKeyboard(courses);
+
+      await bot.telegram
+        .editMessageText(u.id, statusMsg.message_id, undefined, pickerText, {
+          parse_mode: 'HTML',
+          ...kb,
+        })
+        .catch(() => send(u.id, pickerText, kb));
+    } catch (err) {
+      const msg = err instanceof aw.UserFacingError ? err.message : 'Ошибка при входе в портал Uninet.';
+      const errText = `❌ <b>${esc(msg)}</b>`;
+      const errKb = Markup.inlineKeyboard([
+        [btn('🔁 Попробовать снова', 'autowatch')],
+        [btn('🏠 Меню', 'menu')],
+      ]);
+      await bot.telegram
+        .editMessageText(u.id, statusMsg.message_id, undefined, errText, {
+          parse_mode: 'HTML',
+          ...errKb,
+        })
+        .catch(() => send(u.id, errText, errKb));
+    }
+  })();
+});
 
 act(/^aw_pick:(all|\d+)$/, async (ctx) => {
   const u = ctx.state.user;
@@ -1118,7 +1206,11 @@ act(/^att_sem_pick$/, async (ctx) => {
     return alert(ctx, 'Список семестров недоступен');
   }
 
-  const rows = semesters.map((s) => {
+  // University DB contains future placeholder years at start. Show current + past semesters (up to 10)
+  const curIdx = semesters.findIndex((s) => s.current);
+  const displaySemesters = curIdx !== -1 ? semesters.slice(curIdx, curIdx + 10) : semesters.slice(0, 10);
+
+  const rows = displaySemesters.map((s) => {
     const icon = PERIOD_SHORT[s.periodId] || '📅';
     const curHint = s.current ? ' (текущий)' : '';
     return [
