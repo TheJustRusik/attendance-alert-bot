@@ -4,7 +4,18 @@ import * as db from './db.js';
 import * as aw from './autowatcher.js';
 import * as aa from './attendance.js';
 import * as uninet from './uninetApi.js';
-import { redis, setState, getState, clearState, acquireCooldown, cooldownLeft, releaseCooldown } from './redis.js';
+import {
+  redis,
+  setState,
+  getState,
+  clearState,
+  acquireCooldown,
+  cooldownLeft,
+  releaseCooldown,
+  setPendingPool,
+  getPendingPool,
+  delPendingPool,
+} from './redis.js';
 
 export const bot = new Telegraf(config.botToken);
 
@@ -26,6 +37,32 @@ const ROLE_LABEL = { admin: '👑 Админ', moderator: '🛡 Модерато
 const LIST_TITLE = { pools: '🔍 Все пулы', my: '📚 Мои подписки', own: '🛠 Мои пулы' };
 
 const fmtWait = (s) => (s >= 60 ? `${Math.floor(s / 60)} мин ${s % 60} сек` : `${s} сек`);
+
+const declOfNum = (n, titles) => {
+  const cases = [2, 0, 1, 1, 1, 2];
+  return titles[n % 100 > 4 && n % 100 < 20 ? 2 : cases[n % 10 < 5 ? n % 10 : 5]];
+};
+
+let cachedBotUsername = null;
+export function setBotUsername(username) {
+  cachedBotUsername = username;
+}
+export function getBotUsername(ctx) {
+  return ctx?.botInfo?.username || bot.botInfo?.username || cachedBotUsername || '';
+}
+
+export const isGroupChat = (ctx) => ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+
+async function isGroupAdminOrStaff(ctx, userId) {
+  if (isStaff(ctx.state.user)) return true;
+  if (!ctx.chat || ctx.chat.type === 'private') return false;
+  try {
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
+    return member.status === 'creator' || member.status === 'administrator';
+  } catch (e) {
+    return false;
+  }
+}
 
 // ---------- helpers ----------
 async function show(ctx, text, keyboard) {
@@ -200,37 +237,744 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
 
 // ---------- middleware ----------
 bot.use(async (ctx, next) => {
-  if (ctx.chat?.type !== 'private' || !ctx.from) return; // работаем только в личке
+  if (!ctx.from) return;
   ctx.state.user = await db.upsertUser(ctx.from);
   return next();
 });
 
+// ---------- групповой интерфейс ----------
+async function guardPrivateOnly(ctx, commandName) {
+  if (isGroupChat(ctx)) {
+    const botUser = getBotUsername(ctx);
+    const link = botUser ? `https://t.me/${botUser}?start=${commandName}` : null;
+    const kb = link
+      ? Markup.inlineKeyboard([[Markup.button.url('🔒 Открыть в ЛС с ботом', link)]])
+      : undefined;
+    await ctx.reply(
+      `🔒 <b>Эта функция персональная!</b>\n\n` +
+        `Чтобы сохранить конфиденциальность ваших данных (паролей и оценок), команда доступна только в личных сообщениях с ботом.`,
+      { parse_mode: 'HTML', ...kb },
+    );
+    return true;
+  }
+  return false;
+}
+
+async function renderGroupMenu(ctx) {
+  const botUser = getBotUsername(ctx);
+  const count = await db.countPools().catch(() => 0);
+  const chatTitle = ctx.chat?.title ? ` в <b>«${esc(ctx.chat.title)}»</b>` : '';
+
+  const rows = [
+    [btn('➕ Создать пул', 'grp_create'), btn('📋 Пулы группы', 'grp_pools:0')],
+    [btn('🚨 Сообщить об аттендансе', 'grp_alert_pick:0')],
+  ];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('💬 Написать боту в ЛС (Включить уведомления)', `https://t.me/${botUser}?start=group_connect`),
+    ]);
+  }
+  rows.push([btn('❓ Как это работает', 'grp_help')]);
+
+  const text =
+    `🔔 <b>Attendance Alert Bot${chatTitle}</b>\n` +
+    `<i>Твой персональный радар аттенданса 🎯</i>\n\n` +
+    `📚 Активных предметов: <b>${count}</b>\n\n` +
+    `⚡ <b>Быстрый доступ:</b>\n` +
+    `• <b>➕ Создать пул</b> — открыть запись на предмет (или <code>/create Название</code>)\n` +
+    `• <b>📋 Пулы группы</b> — список предметов и вступление в 1 клик\n` +
+    `• <b>🚨 Сообщить об аттендансе</b> — мгновенный алерт всем одногруппникам\n\n` +
+    `<blockquote>⚠️ <b>ВАЖНОЕ ПРАВИЛО TELEGRAM:</b>\n` +
+    `Чтобы уведомления об аттендансе приходили вам — <b>напишите боту в личку</b> (/start)! ` +
+    `Telegram блокирует отправку ЛС ботами, пока вы сами не напишете первыми.</blockquote>`;
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function renderGroupHelp(ctx) {
+  const botUser = getBotUsername(ctx);
+  const rows = [];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('💬 Написать боту в ЛС', `https://t.me/${botUser}?start=group_connect`),
+    ]);
+  }
+  rows.push([btn('📋 Все пулы', 'grp_pools:0'), btn('🏠 Меню группы', 'grp_menu')]);
+
+  const text =
+    `📖 <b>Как работает Attendance Notify Bot:</b>\n\n` +
+    `1️⃣ <b>Пулы предметов:</b>\n` +
+    `Каждый предмет — это отдельный пул. Студенты вступают в пулы тех предметов, которые посещают.\n\n` +
+    `2️⃣ <b>Мгновенные алерты:</b>\n` +
+    `Когда препод начинает отмечать присутствующих — любой студент жмёт кнопку <b>«Берут аттенданс!»</b>. Бот мгновенно шлёт пуш всем участникам в личку!\n\n` +
+    `3️⃣ <b>Авто-аттенданс PGE 🤖:</b>\n` +
+    `В личке с ботом можно привязать аккаунт портала — и бот будет автоматически заходить и отмечать вас по алерту!\n\n` +
+    `<blockquote>⚠️ <b>ПОЧЕМУ НУЖНО НАПИСАТЬ В ЛИЧКУ?</b>\n` +
+    `Telegram устроен так, что бот <b>не может первым написать пользователю</b>. ` +
+    `Если вы не запустите диалог с @${botUser || 'ботом'} (/start), уведомления до вас просто не дойдут!</blockquote>`;
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function renderGroupCreateHelp(ctx) {
+  const botUser = getBotUsername(ctx);
+  const rows = [];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('➕ Создать через бота в ЛС', `https://t.me/${botUser}?start=create_pool`),
+    ]);
+  }
+  rows.push([btn('📋 Все пулы', 'grp_pools:0'), btn('🏠 Меню группы', 'grp_menu')]);
+
+  const text =
+    `✏️ <b>Создание пула для предмета</b>\n\n` +
+    `Чтобы создать пул прямо в группе, отправьте команду с названием:\n` +
+    `<code>/create Название предмета</code>\n\n` +
+    `<i>Примеры:</i>\n` +
+    `• <code>/create Высшая математика</code>\n` +
+    `• <code>/create Computer Networks</code>\n` +
+    `• <code>/create Базы Данных</code>\n\n` +
+    `💡 <i>Либо нажмите кнопку ниже, чтобы создать пул через диалог с ботом:</i>\n\n` +
+    `<blockquote>⚠️ <b>Напоминание:</b> чтобы уведомления об аттендансе доходили до вас — <b>напишите боту в личку</b>!</blockquote>`;
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function handleGroupCreatePool(ctx, poolName) {
+  const u = ctx.state.user;
+  if (poolName.length < 2 || poolName.length > 40) {
+    return ctx.reply(
+      '⚠️ Название должно быть от 2 до 40 символов.\n<i>Пример:</i> <code>/create Высшая математика</code>',
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  // Проверяем, существует ли уже пул с таким названием
+  const existing = await db.findPoolByName(poolName);
+  if (existing) {
+    return ctx.reply(
+      `⚠️ Пул с названием <b>«${esc(existing.name)}»</b> уже существует! Выберите его в списке /pools.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+
+  const reqId = Math.random().toString(36).slice(2, 10);
+  await setPendingPool(reqId, {
+    name: poolName,
+    authorId: u.id,
+    authorName: displayName(u),
+    chatId: ctx.chat.id,
+  });
+
+  const text =
+    `⏳ <b>Пул почти готов! Ждём аппрув модератора</b> 🛡\n\n` +
+    `📚 Предмет: <b>«${esc(poolName)}»</b>\n` +
+    `👤 Предложил: <b>${esc(displayName(u))}</b>\n\n` +
+    `<blockquote>🛡 Модератор или администратор группы должен подтвердить создание пула.\n` +
+    `Тот, кто нажмёт кнопку ниже, станет официальным владельцем этого пула!</blockquote>`;
+
+  const rows = [
+    [btn('🛡 Подтвердить и стать владельцем', `grp_approve:${reqId}`)],
+    [btn('❌ Отклонить', `grp_reject:${reqId}`)],
+  ];
+
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard(rows),
+  });
+}
+
+async function handleGroupApprovePool(ctx, reqId) {
+  const u = ctx.state.user;
+  const req = await getPendingPool(reqId);
+  if (!req) {
+    return alert(ctx, '⚠️ Заявка устарела или уже была обработана.');
+  }
+
+  const canApprove = await isGroupAdminOrStaff(ctx, u.id);
+  if (!canApprove) {
+    return alert(ctx, '⛔ Только модератор или администратор группы может подтвердить создание пула!');
+  }
+
+  const existing = await db.findPoolByName(req.name);
+  if (existing) {
+    await delPendingPool(reqId);
+    return alert(ctx, '⚠️ Пул с таким названием уже существует!');
+  }
+
+  // Назначаем пользователя модератором, если он ещё не staff
+  if (u.role === 'user') {
+    await db.setRole(u.id, 'moderator');
+    u.role = 'moderator';
+  }
+
+  // Создаём пул — владельцем становится тот, кто подтвердил
+  const pool = await db.createPool(req.name, u.id);
+
+  // Инициатора (автора предложения) автоматически добавляем в пул
+  if (req.authorId && req.authorId !== u.id) {
+    await db.joinPool(pool.id, req.authorId);
+  }
+
+  await delPendingPool(reqId);
+  await ctx.answerCbQuery('🎉 Вы подтвердили пул и стали его владельцем!').catch(() => {});
+
+  const updatedPool = await db.getPool(pool.id);
+  const membersCount = updatedPool?.members ?? 1;
+  const botUser = getBotUsername(ctx);
+
+  const rows = [
+    [btn('✅ Вступить в пул (+1)', `grp_join:${pool.id}`)],
+    [btn('📢 Берут аттенданс!', `grp_alert:${pool.id}`)],
+  ];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('🔔 Включить уведомления в ЛС', `https://t.me/${botUser}?start=pool_${pool.id}`),
+    ]);
+  }
+  rows.push([btn('📋 Все пулы группы', 'grp_pools:0')]);
+
+  const authorLine =
+    req.authorId && req.authorId !== u.id ? `\n💡 Предложил: <b>${esc(req.authorName)}</b>` : '';
+
+  const text =
+    `🎉 <b>Пул успешно создан и подтверждён!</b>\n\n` +
+    `📚 Предмет: <b>«${esc(pool.name)}»</b>\n` +
+    `👑 Владелец / Модератор: <b>${esc(displayName(u))}</b>` +
+    authorLine +
+    `\n👥 В пуле: <b>${membersCount}</b> ${declOfNum(membersCount, ['студент', 'студента', 'студентов'])}\n\n` +
+    `👇 <i>Одногруппники, жмите кнопку ниже, чтобы вступить в пул:</i>\n\n` +
+    `<blockquote>⚠️ <b>ВАЖНОЕ ПРАВИЛО TELEGRAM:</b>\n` +
+    `Чтобы бот мог присылать вам уведомления об аттендансе в ЛС — <b>обязательно напишите боту в личку</b> (/start)!` +
+    (botUser ? ` Нажмите кнопку «Включить уведомления в ЛС» ниже 👇` : '') +
+    `</blockquote>`;
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function handleGroupRejectPool(ctx, reqId) {
+  const u = ctx.state.user;
+  const req = await getPendingPool(reqId);
+  if (!req) {
+    return alert(ctx, '⚠️ Заявка устарела или уже была обработана.');
+  }
+
+  const isMod = await isGroupAdminOrStaff(ctx, u.id);
+  const isAuthor = req.authorId === u.id;
+  if (!isMod && !isAuthor) {
+    return alert(ctx, '⛔ Отклонить заявку может только модератор или автор предложения!');
+  }
+
+  await delPendingPool(reqId);
+  await ctx.answerCbQuery('❌ Заявка отклонена').catch(() => {});
+
+  const text =
+    `❌ <b>Создание пула «${esc(req.name)}» отклонено</b>\n\n` +
+    `👤 Отклонил: <b>${esc(displayName(u))}</b>\n` +
+    `💡 Предлагал: ${esc(req.authorName)}`;
+
+  await show(ctx, text, Markup.inlineKeyboard([[btn('🏠 Меню группы', 'grp_menu')]]));
+}
+
+async function handleDirectCreatePool(ctx, name) {
+  const u = ctx.state.user;
+  if (name.length < 2 || name.length > 40) {
+    return ctx.reply('⚠️ Название должно быть от 2 до 40 символов.');
+  }
+  if (!isStaff(u)) {
+    await db.setRole(u.id, 'moderator');
+    u.role = 'moderator';
+  }
+  try {
+    const pool = await db.createPool(name, u.id);
+    await ctx.reply(
+      `✅ Пул <b>«${esc(pool.name)}»</b> создан!\nТеперь студенты могут вступать в него 🎉`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [btn('📚 Открыть пул', `pool:${pool.id}:own`)],
+          [btn('🏠 Меню', 'menu')],
+        ]),
+      },
+    );
+  } catch (e) {
+    if (e.code === '23505') return ctx.reply('⚠️ Пул с таким названием уже существует. Придумайте другое или /cancel.');
+    throw e;
+  }
+}
+
+async function renderGroupPools(ctx, page) {
+  const u = ctx.state.user;
+  const rows = await db.listPools({ kind: 'pools', userId: u.id, limit: PAGE + 1, offset: page * PAGE });
+  const hasNext = rows.length > PAGE;
+  const items = rows.slice(0, PAGE);
+  const botUser = getBotUsername(ctx);
+
+  const kb = items.map((p) => [btn(`📚 ${p.name} · 👥 ${p.members}`, `grp_pool:${p.id}`)]);
+  const pg = pager('grp_pools', page, hasNext);
+  if (pg.length) kb.push(pg);
+
+  kb.push([btn('➕ Создать пул', 'grp_create'), btn('🏠 Меню группы', 'grp_menu')]);
+  if (botUser) {
+    kb.push([
+      Markup.button.url('💬 Включить уведомления в ЛС', `https://t.me/${botUser}?start=pools`),
+    ]);
+  }
+
+  const empty =
+    'В группе пока нет ни одного пула 🤷\n' +
+    'Создайте первый с помощью команды <code>/create Название предмета</code> или кнопки ниже ➕';
+
+  const text =
+    `📚 <b>Пулы предметов группы</b>\n\n` +
+    (items.length
+      ? `Выберите предмет, чтобы <b>вступить</b> или подать <b>сигнал об аттендансе</b> 👇\n\n` +
+        `<blockquote>⚠️ <b>Напоминание:</b> чтобы уведомления доходили до вас — <b>напишите боту в личку</b> (/start)!</blockquote>`
+      : empty);
+
+  await show(ctx, text, Markup.inlineKeyboard(kb));
+}
+
+async function renderGroupPoolCard(ctx, poolId) {
+  const u = ctx.state.user;
+  const pool = await db.getPool(poolId);
+  if (!pool) {
+    return show(
+      ctx,
+      '😕 Пул не найден — возможно, его удалили.',
+      Markup.inlineKeyboard([[btn('📋 Все пулы', 'grp_pools:0')]]),
+    );
+  }
+  const member = await db.isMember(poolId, u.id);
+  const botUser = getBotUsername(ctx);
+
+  const rows = [];
+  if (member) {
+    rows.push([btn('📢 Берут аттенданс!', `grp_alert:${poolId}`)]);
+    if (!owns(u, pool)) {
+      rows.push([btn('🚪 Выйти из пула', `grp_leave:${poolId}`)]);
+    }
+  } else {
+    rows.push([btn('✅ Вступить в пул (+1)', `grp_join:${poolId}`)]);
+  }
+
+  rows.push([btn('📋 Все пулы', 'grp_pools:0'), btn('🏠 Меню группы', 'grp_menu')]);
+  if (botUser) {
+    rows.push([
+      Markup.button.url('💬 Написать боту в ЛС', `https://t.me/${botUser}?start=pool_${poolId}`),
+    ]);
+  }
+
+  const status = member
+    ? '✅ <b>Вы состоите в этом пуле</b>'
+    : '⚪ <i>Вы пока не состоите в этом пуле</i>';
+
+  const text =
+    `📚 <b>Предмет:</b> <code>${esc(pool.name)}</code>\n` +
+    `👑 <b>Создатель:</b> ${esc(ownerName(pool))}\n` +
+    `👥 <b>Участников:</b> <b>${pool.members}</b> ${declOfNum(pool.members, ['студент', 'студента', 'студентов'])}\n\n` +
+    `${status}\n\n` +
+    `🔔 <i>При сигнале об аттендансе бот отправляет пуш всем участникам в личку и может отметить вас на PGE автоматически!</i>\n\n` +
+    `<blockquote>⚠️ <b>ВАЖНО:</b> Уведомление придёт только тем, кто запустил бота в личке! ` +
+    (botUser ? `(@${botUser})` : '') +
+    `</blockquote>`;
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function handleGroupJoin(ctx, poolId) {
+  const u = ctx.state.user;
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден или был удалён');
+
+  const already = await db.isMember(poolId, u.id);
+  if (already) {
+    return alert(ctx, `ℹ️ Вы уже состоите в пуле «${pool.name}»!`);
+  }
+
+  await db.joinPool(poolId, u.id);
+  const botUser = getBotUsername(ctx);
+  const dmHint = botUser
+    ? `\n\n🔔 ВАЖНО: Напишите боту в личку @${botUser}, чтобы Telegram разрешил присылать вам уведомления!`
+    : '';
+
+  await ctx.answerCbQuery(
+    `🎉 Вы успешно вступили в пул «${pool.name}»!${dmHint}`,
+    { show_alert: true },
+  ).catch(() => {});
+
+  await renderGroupPoolCard(ctx, poolId);
+}
+
+async function handleGroupLeave(ctx, poolId) {
+  const u = ctx.state.user;
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+  if (owns(u, pool)) return alert(ctx, '⛔ Владелец не может выйти из своего пула');
+
+  const member = await db.isMember(poolId, u.id);
+  if (!member) return alert(ctx, 'ℹ️ Вы не состоите в этом пуле');
+
+  await db.leavePool(poolId, u.id);
+  await ctx.answerCbQuery('🚪 Вы вышли из пула').catch(() => {});
+  await renderGroupPoolCard(ctx, poolId);
+}
+
+async function renderGroupAlertConfirm(ctx, poolId) {
+  const u = ctx.state.user;
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+
+  const member = await db.isMember(poolId, u.id);
+  if (!member) {
+    return alert(ctx, '⛔ Чтобы подать сигнал об аттендансе, сначала вступите в этот пул!');
+  }
+
+  if (!owns(u, pool)) {
+    const left = await cooldownLeft(poolId, u.id);
+    if (left > 0) return alert(ctx, `⏳ Слишком часто! Подождите ещё ${fmtWait(left)}`);
+  }
+
+  const recipientCount = Math.max(0, pool.members - 1);
+  const text =
+    `🚨 <b>Внимание! Подтверждение алерта</b>\n\n` +
+    `📚 Предмет: <b>«${esc(pool.name)}»</b>\n` +
+    `👤 Сообщил: <b>${esc(displayName(u))}</b>\n` +
+    `👥 Получателей в ЛС: <b>${recipientCount}</b> ${declOfNum(recipientCount, ['студент', 'студента', 'студентов'])}\n\n` +
+    `Вы уверены, что прямо сейчас берут аттенданс? Все участники пула получат мгновенное уведомление в личные сообщения!`;
+
+  const rows = [
+    [btn('🚨 ДА, БЕРУТ АТТЕНДАНС!', `grp_send:${poolId}`)],
+    [btn('❌ Отмена', `grp_pool:${poolId}`)],
+  ];
+
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function handleGroupSendAlert(ctx, poolId) {
+  const u = ctx.state.user;
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+
+  if (!(await db.isMember(poolId, u.id))) {
+    return alert(ctx, '⛔ Вы не состоите в этом пуле');
+  }
+
+  const unlimited = owns(u, pool);
+  if (!unlimited) {
+    const wait = await acquireCooldown(poolId, u.id);
+    if (wait > 0) return alert(ctx, `⏳ Слишком часто! Подождите ещё ${fmtWait(wait)}`);
+  }
+
+  await ctx.answerCbQuery('📨 Рассылаю уведомления…').catch(() => {});
+
+  const ids = await db.memberIds(poolId, u.id);
+  const allPoolUserIds = [u.id, ...ids];
+  const autoRows = await db.getAutoAttendanceForUsers(allPoolUserIds);
+  const autoMap = new Map(autoRows.map((r) => [r.user_id, r]));
+
+  const baseHeader =
+    `🔔 <b>Берут аттенданс!</b>\n\n` +
+    `📚 Пул: <b>${esc(pool.name)}</b>\n` +
+    `👤 От: ${esc(displayName(u))}\n\n`;
+
+  let sent = 0;
+  let failed = 0;
+  for (const memberId of ids) {
+    const memberCfg = autoMap.get(memberId);
+    let msgText = baseHeader + `Скорее отмечайся! 🏃‍♂️💨`;
+    let msgExtra = Markup.inlineKeyboard([[btn('🤖 Авто-аттенданс', 'autoattend')]]);
+
+    if (memberCfg?.enabled) {
+      msgText =
+        baseHeader +
+        `🤖 <i>Авто-аттенданс запущен — захожу на pge.kbtu.kz, чтобы отметить вас…</i>`;
+      msgExtra = {};
+    } else if (memberCfg && !memberCfg.enabled) {
+      msgText = baseHeader + `Скорее отмечайся! 🏃‍♂️💨\n<i>(Авто-аттенданс сейчас на паузе)</i>`;
+      msgExtra = Markup.inlineKeyboard([[btn('⚡ Отметиться сейчас через бота', 'aa_run_now')]]);
+    }
+
+    (await send(memberId, msgText, msgExtra)) ? sent++ : failed++;
+    await sleep(40);
+  }
+
+  if (!unlimited && ids.length > 0 && sent === 0) {
+    await releaseCooldown(poolId, u.id);
+  }
+
+  const enabledConfigs = autoRows.filter((r) => r.enabled);
+  for (const cfg of enabledConfigs) {
+    triggerAutoAttendanceForUser(cfg.user_id, cfg.enc_credentials, {
+      poolName: pool.name,
+      retryIfEmpty: true,
+    });
+  }
+
+  const botUser = getBotUsername(ctx);
+  const rows = [];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('🤖 Отметиться через бота в ЛС', `https://t.me/${botUser}?start=autoattend`),
+    ]);
+    rows.push([
+      Markup.button.url('🔔 Получать пуши в ЛС', `https://t.me/${botUser}?start=group_connect`),
+    ]);
+  }
+  rows.push([btn('📚 К пулу', `grp_pool:${poolId}`), btn('📋 Все пулы', 'grp_pools:0')]);
+
+  const autoNote = enabledConfigs.length
+    ? `\n🤖 Авто-аттенданс запущен для: <b>${enabledConfigs.length}</b> чел.`
+    : '';
+  const failedNote = failed
+    ? `\n⚠️ <b>Не доставлено: ${failed} чел.</b> (нужно написать боту в ЛС!)`
+    : '';
+
+  const reportText =
+    `🚨🚨🚨 <b>АТТЕНДАНС! БЕРУТ АТТЕНДАНС!</b> 🚨🚨🚨\n\n` +
+    `📚 Предмет: <b>«${esc(pool.name)}»</b>\n` +
+    `👤 Сообщил: <b>${esc(displayName(u))}</b>\n` +
+    `📬 Доставлено в ЛС: <b>${sent}</b> чел.` +
+    autoNote +
+    failedNote +
+    `\n\n🏃‍♂️💨 <b>Скорее заходите на портал и отмечайтесь!</b>`;
+
+  await show(ctx, reportText, Markup.inlineKeyboard(rows));
+}
+
+async function renderGroupAlertPicker(ctx, page) {
+  const rows = await db.listPools({ kind: 'pools', userId: 0, limit: PAGE + 1, offset: page * PAGE });
+  const hasNext = rows.length > PAGE;
+  const items = rows.slice(0, PAGE);
+
+  const kb = items.map((p) => [btn(`📢 ${p.name} (👥 ${p.members})`, `grp_alert:${p.id}`)]);
+  const pg = pager('grp_alert_pick', page, hasNext);
+  if (pg.length) kb.push(pg);
+  kb.push([btn('⬅️ Назад в меню группы', 'grp_menu')]);
+
+  const text = items.length
+    ? `📢 <b>Выберите предмет, по которому берут аттенданс:</b>`
+    : `В группе пока нет пулов 🤷 Создайте пул через /create`;
+
+  await show(ctx, text, Markup.inlineKeyboard(kb));
+}
+
+// ---------- события в группе (добавление бота) ----------
+bot.on('new_chat_members', async (ctx) => {
+  const newMembers = ctx.message?.new_chat_members || [];
+  const botUser = getBotUsername(ctx);
+  const me = ctx.botInfo;
+  const isMe = newMembers.some((m) => m.id === me?.id || (botUser && m.username === botUser));
+  if (!isMe) return;
+
+  const rows = [
+    [btn('➕ Создать пул', 'grp_create'), btn('📋 Все пулы / Вступить', 'grp_pools:0')],
+  ];
+  if (botUser) {
+    rows.push([
+      Markup.button.url('💬 Написать боту в ЛС (Обязательно!)', `https://t.me/${botUser}?start=group_connect`),
+    ]);
+  }
+
+  await ctx.reply(
+    `👋 <b>Всем привет! Я Attendance Alert Bot</b> 🔔\n\n` +
+      `Я помогаю вашей группе <b>не пропускать аттенданс</b> и вовремя отмечаться на парах! 🏃‍♂️💨\n\n` +
+      `⚡ <b>Что умеет бот в группе:</b>\n` +
+      `• <b>Создавать пулы предметов:</b> <code>/create Название</code>\n` +
+      `• <b>Вступать в пулы:</b> в 1 клик через «📋 Все пулы»\n` +
+      `• <b>Поднимать тревогу:</b> кнопка «📢 Берут аттенданс!» мгновенно рассылает пуши всем участникам в личку\n` +
+      `• <b>Автоматически отмечаться:</b> через PGE авто-аттенданс 🤖\n\n` +
+      `<blockquote>⚠️ <b>САМОЕ ВАЖНОЕ ПРАВИЛО TELEGRAM:</b>\n` +
+      `Бот технически <b>не может написать пользователю первым</b>. Чтобы получать уведомления об аттендансе, ` +
+      `<b>каждый студент должен перейти по кнопке ниже и нажать Start в личке!</b> 👇</blockquote>`,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      ...Markup.inlineKeyboard(rows),
+    },
+  );
+});
+
+bot.on('my_chat_member', async (ctx) => {
+  const status = ctx.myChatMember?.new_chat_member?.status;
+  if (status === 'member' || status === 'administrator') {
+    if (!isGroupChat(ctx)) return;
+    const botUser = getBotUsername(ctx);
+    const rows = [
+      [btn('➕ Создать пул', 'grp_create'), btn('📋 Все пулы / Вступить', 'grp_pools:0')],
+    ];
+    if (botUser) {
+      rows.push([
+        Markup.button.url('💬 Написать боту в ЛС (Обязательно!)', `https://t.me/${botUser}?start=group_connect`),
+      ]);
+    }
+
+    await ctx.reply(
+      `👋 <b>Attendance Alert Bot готов к работе в группе!</b> 🔔\n\n` +
+        `Создавайте пулы предметов (<code>/create Название</code>), объединяйтесь и вовремя отмечайтесь на парах!\n\n` +
+        `<blockquote>⚠️ <b>Чтобы получать уведомления об аттендансе</b> — обязательно напишите боту в личку:</blockquote>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...Markup.inlineKeyboard(rows),
+      },
+    ).catch(() => {});
+  }
+});
+
 // ---------- команды ----------
 bot.start(async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupMenu(ctx);
+  }
   await resetDialog(ctx.from.id);
+  const payload = ctx.startPayload || ctx.payload || (ctx.message?.text?.split(/\s+/)[1] ?? '');
+
+  if (payload === 'create_pool') {
+    if (!isStaff(ctx.state.user)) {
+      await db.setRole(ctx.state.user.id, 'moderator');
+      ctx.state.user.role = 'moderator';
+    }
+    await setState(ctx.from.id, { type: 'create_pool' });
+    return show(
+      ctx,
+      '✏️ <b>Новый пул</b>\n\nОтправьте название предмета одним сообщением (до 40 символов).\nНапример: <i>Unity Game Engine</i>',
+      Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+    );
+  }
+
+  if (payload && payload.startsWith('pool_')) {
+    const poolId = Number(payload.replace('pool_', ''));
+    if (poolId) {
+      return renderPool(ctx, poolId, 'pools');
+    }
+  }
+
+  if (payload === 'autoattend') {
+    return renderAutoAttend(ctx);
+  }
+
+  if (payload === 'attestation') {
+    return renderAttestation(ctx);
+  }
+
+  if (payload === 'autowatch') {
+    return renderAutoWatch(ctx);
+  }
+
+  if (payload === 'pools') {
+    return renderList(ctx, 'pools', 0);
+  }
+
+  if (payload === 'group_connect' || payload === 'group') {
+    return show(
+      ctx,
+      `👋 Привет, <b>${esc(ctx.state.user.first_name || displayName(ctx.state.user))}</b>!\n\n` +
+        `🔔 <b>Связь с ботом успешно установлена!</b> 🎉\n\n` +
+        `Теперь Telegram разрешает мне отправлять вам личные сообщения:\n` +
+        `• Когда одногруппники нажмут <b>«Берут аттенданс»</b> в вашем предмете — вы мгновенно получите алерт сюда в ЛС! 🏃‍♂️💨\n` +
+        `• Вы можете настроить <b>Авто-аттенданс PGE</b>, чтобы бот сам заходил на <code>pge.kbtu.kz</code> и отмечал вас вовремя! 🤖\n\n` +
+        `Твоя роль: ${ROLE_LABEL[ctx.state.user.role]}`,
+      await buildMainMenu(ctx.state.user),
+    );
+  }
+
   await showMenu(ctx);
 });
+
 bot.command('menu', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupMenu(ctx);
+  }
   await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
+
 bot.command('cancel', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupMenu(ctx);
+  }
   await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
+
+bot.command('pools', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupPools(ctx, 0);
+  }
+  await resetDialog(ctx.from.id);
+  await renderList(ctx, 'pools', 0);
+});
+
+bot.command(['create', 'newpool'], async (ctx) => {
+  const isGroup = isGroupChat(ctx);
+  const rawText = ctx.message?.text || '';
+  const poolName = rawText.replace(/^\/(?:create|newpool)(?:@\w+)?\s*/i, '').trim();
+
+  if (isGroup) {
+    if (!poolName) {
+      return renderGroupCreateHelp(ctx);
+    }
+    return handleGroupCreatePool(ctx, poolName);
+  }
+
+  await resetDialog(ctx.from.id);
+  if (poolName) {
+    return handleDirectCreatePool(ctx, poolName);
+  }
+  if (!isStaff(ctx.state.user)) {
+    await db.setRole(ctx.state.user.id, 'moderator');
+    ctx.state.user.role = 'moderator';
+  }
+  await setState(ctx.from.id, { type: 'create_pool' });
+  await show(
+    ctx,
+    '✏️ <b>Новый пул</b>\n\nОтправьте название предмета одним сообщением (до 40 символов).\nНапример: <i>Unity Game Engine</i>',
+    Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
+  );
+});
+
+bot.command(['alert', 'notify'], async (ctx) => {
+  if (!isGroupChat(ctx)) {
+    await resetDialog(ctx.from.id);
+    return renderList(ctx, 'my', 0);
+  }
+  const rawText = ctx.message?.text || '';
+  const query = rawText.replace(/^\/(?:alert|notify)(?:@\w+)?\s*/i, '').trim();
+  if (query) {
+    const pool = await db.findPoolByName(query);
+    if (pool) {
+      return renderGroupAlertConfirm(ctx, pool.id);
+    }
+  }
+  return renderGroupAlertPicker(ctx, 0);
+});
+
+bot.command('help', async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupHelp(ctx);
+  }
+  await resetDialog(ctx.from.id);
+  await showMenu(ctx);
+});
+
 bot.command('autoattend', async (ctx) => {
+  if (await guardPrivateOnly(ctx, 'autoattend')) return;
   await resetDialog(ctx.from.id);
   await renderAutoAttend(ctx);
 });
 bot.command('autowatch', async (ctx) => {
+  if (await guardPrivateOnly(ctx, 'autowatch')) return;
   await resetDialog(ctx.from.id);
   await renderAutoWatch(ctx);
 });
 bot.command(['attestation', 'grades', 'att'], async (ctx) => {
+  if (await guardPrivateOnly(ctx, 'attestation')) return;
   await resetDialog(ctx.from.id);
   await renderAttestation(ctx);
 });
 bot.command('admin', async (ctx) => {
+  if (await guardPrivateOnly(ctx, 'admin')) return;
   await resetDialog(ctx.from.id);
   if (!isAdmin(ctx.state.user)) {
     return ctx.reply('⛔ Команда доступна только администраторам.');
@@ -238,6 +982,7 @@ bot.command('admin', async (ctx) => {
   await renderAdmin(ctx);
 });
 bot.command('users', async (ctx) => {
+  if (await guardPrivateOnly(ctx, 'users')) return;
   await resetDialog(ctx.from.id);
   if (!isAdmin(ctx.state.user)) {
     return ctx.reply('⛔ Команда доступна только администраторам.');
@@ -246,13 +991,33 @@ bot.command('users', async (ctx) => {
 });
 
 act(/^menu$/, async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupMenu(ctx);
+  }
   await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
 act(/^cancel$/, async (ctx) => {
+  if (isGroupChat(ctx)) {
+    return renderGroupMenu(ctx);
+  }
   await resetDialog(ctx.from.id);
   await showMenu(ctx);
 });
+
+// ---------- групповые колбэки ----------
+act(/^grp_menu$/, (ctx) => renderGroupMenu(ctx));
+act(/^grp_help$/, (ctx) => renderGroupHelp(ctx));
+act(/^grp_create$/, (ctx) => renderGroupCreateHelp(ctx));
+act(/^grp_pools:(\d+)$/, (ctx) => renderGroupPools(ctx, Number(ctx.match[1])));
+act(/^grp_pool:(\d+)$/, (ctx) => renderGroupPoolCard(ctx, Number(ctx.match[1])));
+act(/^grp_join:(\d+)$/, (ctx) => handleGroupJoin(ctx, Number(ctx.match[1])));
+act(/^grp_leave:(\d+)$/, (ctx) => handleGroupLeave(ctx, Number(ctx.match[1])));
+act(/^grp_alert:(\d+)$/, (ctx) => renderGroupAlertConfirm(ctx, Number(ctx.match[1])));
+act(/^grp_send:(\d+)$/, (ctx) => handleGroupSendAlert(ctx, Number(ctx.match[1])));
+act(/^grp_alert_pick:(\d+)$/, (ctx) => renderGroupAlertPicker(ctx, Number(ctx.match[1])));
+act(/^grp_approve:([A-Za-z0-9_-]+)$/, (ctx) => handleGroupApprovePool(ctx, ctx.match[1]));
+act(/^grp_reject:([A-Za-z0-9_-]+)$/, (ctx) => handleGroupRejectPool(ctx, ctx.match[1]));
 
 // ---------- списки ----------
 act(/^(pools|my|own):(\d+)$/, (ctx) => renderList(ctx, ctx.match[1], Number(ctx.match[2])));
@@ -456,7 +1221,13 @@ act(/^delok:(\d+):(pools|my|own)$/, async (ctx) => {
 
 // ---------- создание пула ----------
 act(/^create$/, async (ctx) => {
-  if (!isStaff(ctx.state.user)) return alert(ctx, '⛔ Создавать пулы могут только модераторы');
+  if (isGroupChat(ctx)) {
+    return renderGroupCreateHelp(ctx);
+  }
+  if (!isStaff(ctx.state.user)) {
+    await db.setRole(ctx.state.user.id, 'moderator');
+    ctx.state.user.role = 'moderator';
+  }
   aw.cancelAuthPrompt(ctx.from.id);
   aa.cancelAuthPrompt(ctx.from.id);
   await setState(ctx.from.id, { type: 'create_pool' });
@@ -1410,6 +2181,7 @@ act(/^addmod$/, async (ctx) => {
 
 // ---------- текстовый ввод ----------
 bot.on('text', async (ctx) => {
+  if (isGroupChat(ctx)) return; // В группах обычные текстовые сообщения игнорируются
   const u = ctx.state.user;
   const rawText = ctx.message.text;
   const text = rawText.trim();

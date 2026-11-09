@@ -142,6 +142,22 @@ export async function createPool(name, ownerId) {
   }
 }
 
+export async function countPools() {
+  const { rows } = await q(`SELECT count(*) AS c FROM pools`);
+  return Number(rows[0]?.c ?? 0);
+}
+
+export async function findPoolByName(name) {
+  const { rows } = await q(
+    `SELECT p.*, u.username AS owner_username, u.first_name AS owner_first_name,
+            (SELECT count(*) FROM pool_members m WHERE m.pool_id = p.id) AS members
+       FROM pools p JOIN users u ON u.id = p.owner_id
+      WHERE lower(p.name) = lower($1)`,
+    [name.trim()],
+  );
+  return rows[0];
+}
+
 export async function getPool(id) {
   const { rows } = await q(
     `SELECT p.*, u.username AS owner_username, u.first_name AS owner_first_name,

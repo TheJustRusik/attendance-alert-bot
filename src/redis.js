@@ -33,3 +33,19 @@ export async function acquireCooldown(poolId, userId) {
 }
 
 export const releaseCooldown = (poolId, userId) => redis.del(cdKey(poolId, userId));
+
+// ---------- заявки на создание пула в группе ----------
+const poolReqKey = (reqId) => `pool_req:${reqId}`;
+
+export async function setPendingPool(reqId, data, ttlSec = 86400) {
+  await redis.set(poolReqKey(reqId), JSON.stringify(data), 'EX', ttlSec);
+}
+
+export async function getPendingPool(reqId) {
+  const raw = await redis.get(poolReqKey(reqId));
+  return raw ? JSON.parse(raw) : null;
+}
+
+export async function delPendingPool(reqId) {
+  await redis.del(poolReqKey(reqId));
+}
