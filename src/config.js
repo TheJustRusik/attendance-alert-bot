@@ -23,4 +23,8 @@ export const config = {
   maxAttendanceConcurrency: Math.max(1, Number(process.env.MAX_ATTENDANCE_CONCURRENCY || 3)),
   playwrightHeadless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
   playwrightExecutablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || '',
+  timezone: process.env.TIMEZONE || 'Asia/Almaty',
+  poolPollIntervalMs: Math.max(5, Number(process.env.POOL_POLL_INTERVAL_SEC || 10)) * 1000,
+  maxPoolWatchers: Math.max(1, Number(process.env.MAX_POOL_WATCHERS || 10)),
+  poolRetriggerCooldownMs: Math.max(30, Number(process.env.POOL_RETRIGGER_COOLDOWN_SEC || 300)) * 1000,
 };

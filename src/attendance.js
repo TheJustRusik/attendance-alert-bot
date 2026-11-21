@@ -143,6 +143,7 @@ let idleCloseTimer = null;
 let shuttingDown = false;
 
 let runningSlots = 0;
+let activeMonitors = 0;
 const waitQueue = [];
 /** @type {Map<number, Promise<any>>} */
 const inFlightByUser = new Map();
@@ -156,10 +157,10 @@ function clearIdleCloseTimer() {
 
 function scheduleIdleBrowserClose() {
   clearIdleCloseTimer();
-  if (runningSlots > 0 || waitQueue.length > 0 || !pgeBrowser) return;
+  if (runningSlots > 0 || waitQueue.length > 0 || activeMonitors > 0 || !pgeBrowser) return;
   idleCloseTimer = setTimeout(async () => {
     idleCloseTimer = null;
-    if (runningSlots === 0 && waitQueue.length === 0 && pgeBrowser) {
+    if (runningSlots === 0 && waitQueue.length === 0 && activeMonitors === 0 && pgeBrowser) {
       const b = pgeBrowser;
       pgeBrowser = null;
       await b.close().catch(() => {});
@@ -234,6 +235,10 @@ async function withConcurrencySlot(fn) {
 
 export function activeJobsCount() {
   return runningSlots + waitQueue.length;
+}
+
+export function activeMonitorsCount() {
+  return activeMonitors;
 }
 
 export function isUserJobRunning(userId) {
@@ -657,6 +662,153 @@ export async function runCheckInForUser(userId, encCredentials, { retryIfEmpty =
 
   inFlightByUser.set(userId, task);
   return task;
+}
+
+/**
+ * Opens a lightweight persistent Playwright context for a single "scout" student.
+ * Logs into pge.kbtu.kz/RegistrationOnline ONCE, blocks heavy assets (fonts/media/non-flag images),
+ * and exposes fast 10-second polling (`pollOnce`) with instant in-place Check in clicking.
+ * Does NOT hold a concurrency slot while polling so mass check-ins stay fast.
+ */
+export async function openPgeScoutSession({ encCredentials }) {
+  if (shuttingDown) {
+    throw new AttendanceError('Сервер перезапускается, мониторинг приостановлен.');
+  }
+
+  let creds = decryptCredentials(encCredentials);
+  let login = creds.login;
+  let password = creds.password;
+  creds = null;
+
+  activeMonitors++;
+  clearIdleCloseTimer();
+
+  let context = null;
+  let page = null;
+  let closed = false;
+
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    login = '';
+    password = '';
+    const ctx = context;
+    context = null;
+    page = null;
+    if (ctx) {
+      await ctx.close().catch(() => {});
+    }
+    activeMonitors = Math.max(0, activeMonitors - 1);
+    scheduleIdleBrowserClose();
+  };
+
+  async function ensureLoggedInAndReady(p) {
+    await p.waitForSelector('input[type="password"], img[src*="/flags/"], .v-panel-caption', {
+      timeout: 25000,
+    });
+    await waitVaadinIdle(p, 15000);
+    await switchToEnglishIfNeeded(p);
+
+    const needsLogin = (await p.locator('input[type="password"]').count()) > 0;
+    if (needsLogin) {
+      if (!login || !password) {
+        throw new AttendanceError('Учётные данные сессии разведчика очищены.');
+      }
+      await performPgeLogin(p, login, password);
+    }
+
+    await waitForRegistrationViewReady(p);
+  }
+
+  async function checkNow() {
+    if (closed || !page || page.isClosed()) {
+      throw new AttendanceError('Сессия разведчика закрыта.');
+    }
+
+    const activeCount = await countEnabledCheckIns(page);
+    if (activeCount === 0) {
+      return { detected: false, checkedCount: 0, disciplines: [], notifications: [] };
+    }
+
+    const res = await clickAllCheckIns(page);
+    await waitVaadinIdle(page, 5000);
+    await sleep(250);
+
+    return {
+      detected: res.checkedCount > 0,
+      status: res.checkedCount > 0 ? 'checked' : 'none',
+      checkedCount: res.checkedCount,
+      disciplines: res.disciplines,
+      notifications: [...new Set(res.notifications)],
+    };
+  }
+
+  try {
+    const browser = await ensurePgeBrowser();
+    if (shuttingDown) {
+      throw new AttendanceError('Сервер перезапускается, мониторинг приостановлен.');
+    }
+
+    context = await browser.newContext({
+      viewport: { width: 800, height: 600 },
+      locale: 'en-US',
+      ignoreHTTPSErrors: true,
+    });
+
+    // Block heavy non-essential resources to minimize RAM/CPU/network during long windows
+    await context.route('**/*', (route) => {
+      const req = route.request();
+      const type = req.resourceType();
+      if (type === 'media' || type === 'font') {
+        return route.abort().catch(() => {});
+      }
+      if (type === 'image') {
+        const url = req.url();
+        if (!url.includes('/flags/') && !url.includes('logout') && !url.includes('exit')) {
+          return route.abort().catch(() => {});
+        }
+      }
+      return route.continue().catch(() => {});
+    });
+
+    page = await context.newPage();
+    await page.goto(`${config.pgeUrl}/RegistrationOnline`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+
+    await ensureLoggedInAndReady(page);
+  } catch (err) {
+    await close();
+    if (err instanceof AttendanceError) throw err;
+    console.error('[PoolScout] Failed to open scout session:', err.message);
+    throw new AttendanceError('Не удалось подключиться к порталу pge.kbtu.kz (таймаут или сбой сети).');
+  }
+
+  return {
+    checkNow,
+
+    async pollOnce() {
+      if (closed || !page || page.isClosed()) {
+        throw new AttendanceError('Страница мониторинга закрыта.');
+      }
+      try {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
+        await ensureLoggedInAndReady(page);
+        return await checkNow();
+      } catch (err) {
+        if (err instanceof AttendanceError) throw err;
+        console.error('[PoolScout] Poll error:', err.message);
+        throw new AttendanceError('Сбой при обновлении страницы pge.kbtu.kz.');
+      }
+    },
+
+    isAlive() {
+      return !closed && Boolean(page && !page.isClosed()) && Boolean(pgeBrowser?.isConnected());
+    },
+
+    close,
+  };
 }
 
 export async function shutdownAttendance() {

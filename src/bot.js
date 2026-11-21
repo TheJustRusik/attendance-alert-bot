@@ -5,6 +5,15 @@ import * as aw from './autowatcher.js';
 import * as aa from './attendance.js';
 import * as uninet from './uninetApi.js';
 import {
+  poolScheduler,
+  DAY_SHORT,
+  DAY_FULL,
+  formatMinute,
+  formatScheduleWindow,
+  parseTimeRange,
+  getZonedNow,
+} from './poolScheduler.js';
+import {
   redis,
   setState,
   getState,
@@ -201,6 +210,7 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
   const member = await db.isMember(poolId, u.id);
   const owner = owns(u, pool);
   const aaCfg = member ? await db.getAutoAttendance(u.id) : null;
+  const schedules = await db.listPoolSchedules(poolId);
 
   const rows = [];
   if (member) {
@@ -209,10 +219,26 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
   } else {
     rows.push([btn('✅ Вступить в пул', `join:${poolId}:${kind}`)]);
   }
+  if (isAdmin(u)) {
+    const enabledCount = schedules.filter((s) => s.enabled).length;
+    const badge = schedules.length ? ` (${enabledCount}/${schedules.length})` : '';
+    rows.push([btn(`⏰ Авто-аттенданс пула${badge}`, `pscheds:${poolId}:${kind}`)]);
+  }
   if (canManage(u, pool)) {
     rows.push([btn('👥 Участники', `members:${poolId}:0:${kind}`), btn('🗑 Удалить пул', `del:${poolId}:${kind}`)]);
   }
   rows.push([btn('⬅️ Назад', `${kind}:0`), btn('🏠 Меню', 'menu')]);
+
+  const enabledSchedules = schedules.filter((s) => s.enabled);
+  const schedLine = enabledSchedules.length
+    ? `\n⏰ Авто-мониторинг (${esc(config.timezone)}): ` +
+      enabledSchedules
+        .map((s) => {
+          const live = poolScheduler.getActiveWatcher(s.id);
+          return `<b>${esc(formatScheduleWindow(s))}</b>${live ? ' 🟢' : ''}`;
+        })
+        .join(', ')
+    : '';
 
   const aaLine = member
     ? aaCfg
@@ -230,7 +256,7 @@ async function renderPool(ctx, poolId, kind = 'pools', note = '') {
 
   await show(
     ctx,
-    `📚 <b>${esc(pool.name)}</b>\n\n👤 Модератор: ${esc(ownerName(pool))}\n👥 Участников: ${pool.members}\n\n${status}${note ? `\n\n${note}` : ''}`,
+    `📚 <b>${esc(pool.name)}</b>\n\n👤 Модератор: ${esc(ownerName(pool))}\n👥 Участников: ${pool.members}${schedLine}\n\n${status}${note ? `\n\n${note}` : ''}`,
     Markup.inlineKeyboard(rows),
   );
 }
@@ -1210,6 +1236,7 @@ act(/^delok:(\d+):(pools|my|own)$/, async (ctx) => {
   if (!canManage(u, pool)) return alert(ctx, '⛔ Нет доступа');
 
   const memberIds = await db.deletePool(id);
+  void poolScheduler.syncNow();
   await ctx.answerCbQuery('🗑 Пул удалён').catch(() => {});
   for (const m of memberIds) {
     if (m === u.id) continue;
@@ -1247,82 +1274,104 @@ function fmtDateTime(d) {
   return `${pad2(dt.getDate())}.${pad2(dt.getMonth() + 1)} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
 }
 
-function triggerAutoAttendanceForUser(
+async function executeAndNotifyAutoAttendance(
   userId,
   encCredentials,
   { poolName = null, retryIfEmpty = false, editMessageId = null } = {},
 ) {
-  (async () => {
-    const res = await aa.runCheckInForUser(userId, encCredentials, { retryIfEmpty });
-    const poolLine = poolName ? `\n📚 Пул: <b>${esc(poolName)}</b>` : '';
+  const res = await aa.runCheckInForUser(userId, encCredentials, { retryIfEmpty });
+  const poolLine = poolName ? `\n📚 Пул: <b>${esc(poolName)}</b>` : '';
 
-    let statusSummary = '';
-    let replyHtml = '';
-    let replyKb = Markup.inlineKeyboard([
+  let statusSummary = '';
+  let replyHtml = '';
+  let replyKb = Markup.inlineKeyboard([
+    [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+  ]);
+
+  if (res.status === 'checked') {
+    statusSummary = `✅ Отмечено: ${res.checkedCount}`;
+    const discList = res.disciplines?.length
+      ? `\n📖 Дисциплины:\n` + res.disciplines.map((d) => `• <i>${esc(d)}</i>`).join('\n')
+      : '';
+    replyHtml =
+      `✅ <b>Авто-аттенданс успешно отмечен!</b>` +
+      poolLine +
+      `\n✔️ Нажато активных Check in: <b>${res.checkedCount}</b>` +
+      discList;
+  } else if (res.status === 'none') {
+    statusSummary = 'ℹ️ Активных Check in не было';
+    replyHtml =
+      `ℹ️ <b>Авто-аттенданс проверил pge.kbtu.kz</b>` +
+      poolLine +
+      `\n\nАктивных кнопок <code>Check in</code> сейчас нет ` +
+      `<i>(возможно, вы уже отмечены или преподаватель ещё не открыл / уже закрыл отметку)</i>.`;
+    replyKb = Markup.inlineKeyboard([
+      [btn('🔄 Проверить ещё раз', 'aa_run_now')],
       [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
     ]);
+  } else if (res.status === 'invalid_credentials' || res.status === 'decryption_error') {
+    statusSummary = '❌ Ошибка входа (пауза)';
+    await db.setAutoAttendanceEnabled(userId, false).catch(() => {});
+    replyHtml =
+      `❌ <b>Авто-аттенданс не смог войти в pge.kbtu.kz</b>` +
+      poolLine +
+      `\nПричина: ${esc(res.error || 'Неверный логин или пароль.')}\n\n` +
+      `⏸ Авто-аттенданс временно поставлен на паузу — обновите логин/пароль в настройках!`;
+    replyKb = Markup.inlineKeyboard([
+      [btn('🔑 Обновить данные PGE', 'aa_setup')],
+      [btn('🏠 Меню', 'menu')],
+    ]);
+  } else {
+    statusSummary = '⚠️ Ошибка сети/портала';
+    replyHtml =
+      `⚠️ <b>Авто-аттенданс: сбой при обращении к pge.kbtu.kz</b>` +
+      poolLine +
+      `\n<i>${esc(res.error || 'Портал временно недоступен.')}</i>\n\n` +
+      `Проверьте отметку вручную или повторите попытку:`;
+    replyKb = Markup.inlineKeyboard([
+      [btn('🔄 Повторить сейчас', 'aa_run_now')],
+      [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+    ]);
+  }
 
-    if (res.status === 'checked') {
-      statusSummary = `✅ Отмечено: ${res.checkedCount}`;
-      const discList = res.disciplines?.length
-        ? `\n📖 Дисциплины:\n` + res.disciplines.map((d) => `• <i>${esc(d)}</i>`).join('\n')
-        : '';
-      replyHtml =
-        `✅ <b>Авто-аттенданс успешно отмечен!</b>` +
-        poolLine +
-        `\n✔️ Нажато активных Check in: <b>${res.checkedCount}</b>` +
-        discList;
-    } else if (res.status === 'none') {
-      statusSummary = 'ℹ️ Активных Check in не было';
-      replyHtml =
-        `ℹ️ <b>Авто-аттенданс проверил pge.kbtu.kz</b>` +
-        poolLine +
-        `\n\nАктивных кнопок <code>Check in</code> сейчас нет ` +
-        `<i>(возможно, вы уже отмечены или преподаватель ещё не открыл / уже закрыл отметку)</i>.`;
-      replyKb = Markup.inlineKeyboard([
-        [btn('🔄 Проверить ещё раз', 'aa_run_now')],
-        [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
-      ]);
-    } else if (res.status === 'invalid_credentials' || res.status === 'decryption_error') {
-      statusSummary = '❌ Ошибка входа (пауза)';
-      await db.setAutoAttendanceEnabled(userId, false).catch(() => {});
-      replyHtml =
-        `❌ <b>Авто-аттенданс не смог войти в pge.kbtu.kz</b>` +
-        poolLine +
-        `\nПричина: ${esc(res.error || 'Неверный логин или пароль.')}\n\n` +
-        `⏸ Авто-аттенданс временно поставлен на паузу — обновите логин/пароль в настройках!`;
-      replyKb = Markup.inlineKeyboard([
-        [btn('🔑 Обновить данные PGE', 'aa_setup')],
-        [btn('🏠 Меню', 'menu')],
-      ]);
-    } else {
-      statusSummary = '⚠️ Ошибка сети/портала';
-      replyHtml =
-        `⚠️ <b>Авто-аттенданс: сбой при обращении к pge.kbtu.kz</b>` +
-        poolLine +
-        `\n<i>${esc(res.error || 'Портал временно недоступен.')}</i>\n\n` +
-        `Проверьте отметку вручную или повторите попытку:`;
-      replyKb = Markup.inlineKeyboard([
-        [btn('🔄 Повторить сейчас', 'aa_run_now')],
-        [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
-      ]);
-    }
+  await db.updateAutoAttendanceRun(userId, statusSummary).catch(() => {});
 
-    await db.updateAutoAttendanceRun(userId, statusSummary).catch(() => {});
+  if (editMessageId) {
+    await bot.telegram
+      .editMessageText(userId, editMessageId, undefined, replyHtml, {
+        parse_mode: 'HTML',
+        ...replyKb,
+      })
+      .catch(() => send(userId, replyHtml, replyKb));
+  } else {
+    await send(userId, replyHtml, replyKb);
+  }
 
-    if (editMessageId) {
-      await bot.telegram
-        .editMessageText(userId, editMessageId, undefined, replyHtml, {
-          parse_mode: 'HTML',
-          ...replyKb,
-        })
-        .catch(() => send(userId, replyHtml, replyKb));
-    } else {
-      await send(userId, replyHtml, replyKb);
-    }
-  })().catch((err) => {
+  return res;
+}
+
+function triggerAutoAttendanceForUser(userId, encCredentials, opts = {}) {
+  executeAndNotifyAutoAttendance(userId, encCredentials, opts).catch((err) => {
     console.error(`[AutoAttendance] Unhandled error for user ${userId}:`, err.message);
   });
+}
+
+async function notifyScoutCheckInResult(userId, poolName, res) {
+  const statusSummary = `✅ Отмечено: ${res.checkedCount}`;
+  await db.updateAutoAttendanceRun(userId, statusSummary).catch(() => {});
+
+  const discList = res.disciplines?.length
+    ? `\n📖 Дисциплины:\n` + res.disciplines.map((d) => `• <i>${esc(d)}</i>`).join('\n')
+    : '';
+  const replyHtml =
+    `✅ <b>Авто-аттенданс успешно отмечен!</b> <i>(авто-мониторинг пула)</i>` +
+    `\n📚 Пул: <b>${esc(poolName)}</b>` +
+    `\n✔️ Нажато активных Check in: <b>${res.checkedCount}</b>` +
+    discList;
+  const replyKb = Markup.inlineKeyboard([
+    [btn('⚙️ Авто-аттенданс', 'autoattend'), btn('🏠 Меню', 'menu')],
+  ]);
+  await send(userId, replyHtml, replyKb);
 }
 
 async function renderAutoAttend(ctx, note = '') {
@@ -2110,6 +2159,7 @@ async function renderAdmin(ctx, note = '') {
     ctx,
     `👑 <b>Админ-панель</b>${note ? `\n\n${note}` : ''}`,
     Markup.inlineKeyboard([
+      [btn('⏰ Расписания пулов', 'psched_all:0')],
       [btn('👥 Пользователи', 'users:0')],
       [btn('🛡 Модераторы', 'mods:0'), btn('➕ Назначить', 'addmod')],
       [btn('📊 Статистика', 'stats')],
@@ -2133,6 +2183,7 @@ act(/^stats$/, async (ctx) => {
       `📚 Пулов: ${s.pools}\n` +
       `🔗 Подписок: ${s.memberships}\n` +
       `🤖 Авто-аттенданс PGE: ${s.auto_attendance_enabled} вкл / ${s.auto_attendance_total} всего (в работе: ${aa.activeJobsCount()})\n` +
+      `⏰ Расписания пулов: ${s.pool_schedules_enabled} вкл / ${s.pool_schedules_total} всего (наблюдателей: ${poolScheduler.activeWatchersCount()} / ${config.maxPoolWatchers})\n` +
       `🎬 Сессий Uninet: ${aw.activeSessionCount()} / ${config.maxWatchSessions}`,
     Markup.inlineKeyboard([[btn('⬅️ Назад', 'admin')]]),
   );
@@ -2177,6 +2228,642 @@ act(/^addmod$/, async (ctx) => {
     '➕ <b>Новый модератор</b>\n\nОтправьте <code>@username</code> или Telegram ID пользователя.\n⚠️ Он должен хотя бы раз запустить бота (/start).',
     Markup.inlineKeyboard([[btn('❌ Отмена', 'cancel')]]),
   );
+});
+
+// ---------- расписание авто-аттенданса пулов (админ) ----------
+function fmtScoutFromSchedule(sched) {
+  if (sched.scout_user_id == null) return '🎲 Случайный участник';
+  const name = sched.scout_username
+    ? `@${sched.scout_username}`
+    : sched.scout_first_name || `id${sched.scout_user_id}`;
+  const mask = sched.scout_login_mask ? ` (${sched.scout_login_mask})` : '';
+  const warn = sched.scout_aa_enabled ? '' : ' ⚠️';
+  return `${name}${mask}${warn}`;
+}
+
+function fmtScoutUser(scout) {
+  if (!scout) return '—';
+  const name = scout.username ? `@${scout.username}` : scout.first_name || `id${scout.user_id}`;
+  return scout.login_mask ? `${name} (${scout.login_mask})` : name;
+}
+
+async function notifyAdmins(html, extra = {}) {
+  const adminIds = await db.listAdminIds().catch(() => []);
+  for (const adminId of adminIds) {
+    await send(adminId, html, extra);
+    await sleep(40);
+  }
+}
+
+async function handleScheduledAttendanceDetected({ schedule, scout, scoutResult, stoppedAfterDetect }) {
+  // 1. Уведомляем самого разведчика (он уже отмечен в открытой вкладке)
+  await notifyScoutCheckInResult(scout.user_id, schedule.pool_name, scoutResult);
+
+  // 2. Берём всех участников пула и их конфиги авто-аттенданса
+  const allMemberIds = await db.memberIds(schedule.pool_id);
+  const autoRows = await db.getAutoAttendanceForUsers(allMemberIds);
+  const autoMap = new Map(autoRows.map((r) => [r.user_id, r]));
+
+  const otherIds = allMemberIds.filter((id) => id !== scout.user_id);
+  const discHint = scoutResult.disciplines?.length
+    ? `\n📖 Дисциплина: <i>${esc(scoutResult.disciplines.join(', '))}</i>`
+    : '';
+  const baseHeader =
+    `🔔 <b>Берут аттенданс!</b> <i>(авто-мониторинг пула)</i>\n\n` +
+    `📚 Пул: <b>${esc(schedule.pool_name)}</b>` +
+    discHint +
+    `\n\n`;
+
+  const autoTargets = [];
+  let pushSent = 0;
+  let pushFailed = 0;
+
+  for (const memberId of otherIds) {
+    const memberCfg = autoMap.get(memberId);
+    if (memberCfg?.enabled) {
+      autoTargets.push(memberCfg);
+      await send(
+        memberId,
+        baseHeader + `🤖 <i>Авто-аттенданс запущен — захожу на pge.kbtu.kz, чтобы отметить вас…</i>`,
+      );
+    } else if (memberCfg && !memberCfg.enabled) {
+      const ok = await send(
+        memberId,
+        baseHeader + `Скорее отмечайся! 🏃‍♂️💨\n<i>(Авто-аттенданс сейчас на паузе)</i>`,
+        Markup.inlineKeyboard([[btn('⚡ Отметиться сейчас через бота', 'aa_run_now')]]),
+      );
+      ok ? pushSent++ : pushFailed++;
+    } else {
+      const ok = await send(
+        memberId,
+        baseHeader + `Скорее отмечайся! 🏃‍♂️💨`,
+        Markup.inlineKeyboard([[btn('🤖 Авто-аттенданс', 'autoattend')]]),
+      );
+      ok ? pushSent++ : pushFailed++;
+    }
+    await sleep(40);
+  }
+
+  // 3. Массовая отметка остальных участников с включённым авто-аттендансом
+  const batchResults = await Promise.allSettled(
+    autoTargets.map((cfg) =>
+      executeAndNotifyAutoAttendance(cfg.user_id, cfg.enc_credentials, {
+        poolName: schedule.pool_name,
+        retryIfEmpty: true,
+      }),
+    ),
+  );
+
+  let checked = 1; // сам разведчик уже отмечен
+  let none = 0;
+  let invalid = 0;
+  let errors = 0;
+  for (const item of batchResults) {
+    if (item.status !== 'fulfilled') {
+      errors++;
+      continue;
+    }
+    const st = item.value?.status;
+    if (st === 'checked') checked++;
+    else if (st === 'none') none++;
+    else if (st === 'invalid_credentials' || st === 'decryption_error') invalid++;
+    else errors++;
+  }
+
+  const totalAuto = 1 + autoTargets.length;
+  await db
+    .updatePoolScheduleStatus(schedule.id, `✅ Отмечено: ${checked}/${totalAuto}`)
+    .catch(() => {});
+
+  // 4. Сводный отчёт админам
+  const discBlock = scoutResult.disciplines?.length
+    ? `\n📖 Дисциплины: <i>${esc(scoutResult.disciplines.join('; '))}</i>`
+    : '';
+  const details = [];
+  if (none > 0) details.push(`ℹ️ нет активных: ${none}`);
+  if (invalid > 0) details.push(`❌ ошибка входа (пауза): ${invalid}`);
+  if (errors > 0) details.push(`⚠️ сбой сети: ${errors}`);
+  const detailLine = details.length ? `\n   └ ${details.join(' · ')}` : '';
+  const pushLine =
+    pushSent + pushFailed > 0
+      ? `\n📬 Пуш-уведомлений (без авто-аттенданса): <b>${pushSent}</b>` +
+        (pushFailed ? ` (не доставлено: ${pushFailed})` : '')
+      : '';
+  const modeLine = stoppedAfterDetect
+    ? `\n⏹ Мониторинг этого окна завершён.`
+    : `\n🔁 Продолжаю мониторинг до <b>${esc(formatMinute(schedule.end_minute))}</b>.`;
+
+  await notifyAdmins(
+    `🤖 <b>Отчёт авто-мониторинга пула</b>\n\n` +
+      `📚 Пул: <b>${esc(schedule.pool_name)}</b>\n` +
+      `⏰ Окно: <b>${esc(formatScheduleWindow(schedule))}</b>\n` +
+      `🔎 Разведчик: <code>${esc(fmtScoutUser(scout))}</code>` +
+      discBlock +
+      `\n\n✅ Отмечено автоматически: <b>${checked} из ${totalAuto}</b>` +
+      detailLine +
+      pushLine +
+      modeLine,
+    Markup.inlineKeyboard([[btn('⚙️ Открыть слот', `psched:${schedule.id}:admin`)]]),
+  );
+}
+
+async function handleScoutFailed({ schedule, failedScout, reason, nextScout }) {
+  // Уведомляем самого пользователя, у которого слетел вход
+  await send(
+    failedScout.user_id,
+    `❌ <b>Авто-аттенданс не смог войти в pge.kbtu.kz</b>\n` +
+      `📚 Пул: <b>${esc(schedule.pool_name)}</b>\n` +
+      `Причина: ${esc(reason || 'Неверный логин или пароль.')}\n\n` +
+      `⏸ Авто-аттенданс поставлен на паузу — обновите логин/пароль в настройках!`,
+    Markup.inlineKeyboard([
+      [btn('🔑 Обновить данные PGE', 'aa_setup')],
+      [btn('🏠 Меню', 'menu')],
+    ]),
+  );
+
+  // Уведомляем админов о failover
+  const failoverLine = nextScout
+    ? `🔄 Автоматически переключился на другого разведчика: <code>${esc(fmtScoutUser(nextScout))}</code>.`
+    : `⛔ В пуле больше нет доступных разведчиков с включённым PGE — мониторинг окна остановлен.`;
+
+  await notifyAdmins(
+    `⚠️ <b>Сбой разведчика авто-мониторинга</b>\n\n` +
+      `📚 Пул: <b>${esc(schedule.pool_name)}</b> (${esc(formatScheduleWindow(schedule))})\n` +
+      `👤 Проблемный аккаунт: <code>${esc(fmtScoutUser(failedScout))}</code>\n` +
+      `Причина: <i>${esc(reason || 'Ошибка входа')}</i>\n\n` +
+      failoverLine,
+    Markup.inlineKeyboard([[btn('⚙️ Открыть слот', `psched:${schedule.id}:admin`)]]),
+  );
+}
+
+async function handleScoutFallback({ schedule, fallbackScout }) {
+  await notifyAdmins(
+    `ℹ️ <b>Авто-замена разведчика</b>\n\n` +
+      `📚 Пул: <b>${esc(schedule.pool_name)}</b> (${esc(formatScheduleWindow(schedule))})\n` +
+      `Назначенный разведчик недоступен (пауза / вышел из пула / удалил PGE).\n` +
+      `🔄 Вместо него выбран случайный участник: <code>${esc(fmtScoutUser(fallbackScout))}</code>.`,
+    Markup.inlineKeyboard([[btn('⚙️ Открыть слот', `psched:${schedule.id}:admin`)]]),
+  );
+}
+
+async function handleNoEligibleScout({ schedule }) {
+  await notifyAdmins(
+    `⚠️ <b>Мониторинг не запущен — нет разведчиков</b>\n\n` +
+      `📚 Пул: <b>${esc(schedule.pool_name)}</b> (${esc(formatScheduleWindow(schedule))})\n` +
+      `В пуле сейчас нет ни одного участника с подключённым и включённым авто-аттендансом PGE.`,
+    Markup.inlineKeyboard([[btn('⚙️ Открыть слот', `psched:${schedule.id}:admin`)]]),
+  );
+}
+
+export function startPoolScheduler() {
+  poolScheduler.start({
+    onAttendanceDetected: handleScheduledAttendanceDetected,
+    onScoutFailed: handleScoutFailed,
+    onScoutFallback: handleScoutFallback,
+    onNoEligibleScout: handleNoEligibleScout,
+  });
+}
+
+async function renderAllPoolSchedules(ctx, page = 0) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const total = await db.countPoolSchedules();
+  const rows = await db.listAllPoolSchedules(PAGE + 1, page * PAGE);
+  const hasNext = rows.length > PAGE;
+  const items = rows.slice(0, PAGE);
+  const now = getZonedNow();
+
+  const kb = items.map((s) => {
+    const live = poolScheduler.getActiveWatcher(s.id);
+    const icon = live ? '🟢' : s.enabled ? '⏰' : '⏸';
+    return [btn(`${icon} ${s.pool_name} · ${formatScheduleWindow(s)}`, `psched:${s.id}:admin`)];
+  });
+  const pg = pager('psched_all', page, hasNext);
+  if (pg.length) kb.push(pg);
+  kb.push([btn('➕ Добавить расписание пулу', 'psched_pick_pool:0')]);
+  kb.push([btn('🔄 Обновить', `psched_all:${page}`), btn('⬅️ В админку', 'admin')]);
+
+  const text =
+    `⏰ <b>Расписания авто-аттенданса пулов</b>\n` +
+    `🕒 Время сервера (${esc(config.timezone)}): <code>${esc(DAY_SHORT[now.dayOfWeek])} ${esc(now.timeLabel)}</code>\n` +
+    `👁 Активных наблюдателей: <b>${poolScheduler.activeWatchersCount()} / ${config.maxPoolWatchers}</b> · Всего слотов: <b>${total}</b>\n\n` +
+    (items.length
+      ? `Выберите слот для настройки или добавьте новый:\n<i>🟢 — мониторинг активен прямо сейчас · ⏰ — ждёт окна · ⏸ — на паузе</i>`
+      : `Расписаний пока нет. Нажмите «➕ Добавить расписание пулу», чтобы настроить авто-проверку.`);
+
+  await show(ctx, text, Markup.inlineKeyboard(kb));
+}
+
+async function renderSchedulePoolPicker(ctx, page = 0) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const rows = await db.listPools({ kind: 'pools', userId: ctx.state.user.id, limit: PAGE + 1, offset: page * PAGE });
+  const hasNext = rows.length > PAGE;
+  const items = rows.slice(0, PAGE);
+
+  const kb = items.map((p) => [btn(`📚 ${p.name} · 👥 ${p.members}`, `pscheds:${p.id}:admin`)]);
+  const pg = pager('psched_pick_pool', page, hasNext);
+  if (pg.length) kb.push(pg);
+  kb.push([btn('⬅️ К расписаниям', 'psched_all:0'), btn('👑 Админка', 'admin')]);
+
+  await show(
+    ctx,
+    `📚 <b>Выберите пул для настройки авто-аттенданса:</b>\n\n` +
+      (items.length ? 'Нажмите на нужный предмет:' : 'Пулов пока нет 🤷'),
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+async function renderPoolSchedules(ctx, poolId, kind = 'pools', note = '') {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const pool = await db.getPool(poolId);
+  if (!pool) {
+    return show(
+      ctx,
+      '😕 Пул не найден — возможно, его удалили.',
+      Markup.inlineKeyboard([[btn('⬅️ Назад', kind === 'admin' ? 'psched_all:0' : `${kind}:0`)]]),
+    );
+  }
+
+  const schedules = await db.listPoolSchedules(poolId);
+  const eligible = await db.listEligibleScoutsForPool(poolId);
+  const now = getZonedNow();
+
+  const kb = schedules.map((s) => {
+    const live = poolScheduler.getActiveWatcher(s.id);
+    const icon = live ? '🟢' : s.enabled ? '⏰' : '⏸';
+    const scoutHint = s.scout_user_id == null ? '🎲' : '👤';
+    return [btn(`${icon} ${formatScheduleWindow(s)} · ${scoutHint}`, `psched:${s.id}:${kind}`)];
+  });
+  kb.push([btn('➕ Добавить расписание', `psched_add:${poolId}:${kind}`)]);
+  kb.push([
+    btn('🔄 Обновить', `pscheds:${poolId}:${kind}`),
+    btn(kind === 'admin' ? '⬅️ Все расписания' : '⬅️ К пулу', kind === 'admin' ? 'psched_all:0' : `pool:${poolId}:${kind}`),
+  ]);
+
+  const listLines = schedules.length
+    ? schedules
+        .map((s) => {
+          const live = poolScheduler.getActiveWatcher(s.id);
+          const st = live ? '🟢 в эфире' : s.enabled ? '⏰ вкл' : '⏸ пауза';
+          return `• <b>${esc(formatScheduleWindow(s))}</b> (${st}) — ${esc(fmtScoutFromSchedule(s))}`;
+        })
+        .join('\n')
+    : '<i>Для этого пула ещё не добавлено ни одного расписания.</i>';
+
+  const eligibleWarn =
+    eligible.length === 0
+      ? `\n\n⚠️ <i>В пуле пока нет участников с включённым авто-аттендансом PGE — мониторинг не сможет запуститься, пока кто-то не подключит /autoattend.</i>`
+      : '';
+
+  await show(
+    ctx,
+    `⏰ <b>Авто-аттенданс пула «${esc(pool.name)}»</b>\n` +
+      `🕒 Сейчас (${esc(config.timezone)}): <code>${esc(DAY_SHORT[now.dayOfWeek])} ${esc(now.timeLabel)}</code>\n` +
+      `🤖 Участников с активным PGE: <b>${eligible.length}</b> из ${pool.members}\n\n` +
+      listLines +
+      eligibleWarn +
+      (note ? `\n\n${note}` : ''),
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+async function renderScheduleCard(ctx, schedId, kind = 'pools', note = '') {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) {
+    return show(
+      ctx,
+      '😕 Слот расписания не найден — возможно, его удалили.',
+      Markup.inlineKeyboard([[btn('⬅️ Все расписания', 'psched_all:0')]]),
+    );
+  }
+
+  const watcher = poolScheduler.getActiveWatcher(sched.id);
+  const eligible = await db.listEligibleScoutsForPool(sched.pool_id);
+  const now = getZonedNow();
+
+  const statusLine = watcher
+    ? watcher.state === 'cooldown'
+      ? `🟡 <b>Пауза после отметки</b> (ждёт повторной проверки)`
+      : `🟢 <b>Мониторинг активен прямо сейчас</b>`
+    : sched.enabled
+      ? `⏰ <b>Включён</b> (ждёт окна)`
+      : `⏸ <b>На паузе</b>`;
+
+  let liveBlock = '';
+  if (watcher) {
+    const elapsedSec = Math.floor((Date.now() - watcher.startedAt) / 1000);
+    const scoutNow = watcher.scout ? fmtScoutUser(watcher.scout) : 'выбор…';
+    liveBlock =
+      `\n\n📡 <b>Живой статус:</b>\n` +
+      `  ├ Текущий разведчик: <code>${esc(scoutNow)}</code>\n` +
+      `  ├ Проверок выполнено: <b>${watcher.pollsCount}</b> (каждые ${Math.round(config.poolPollIntervalMs / 1000)}с)\n` +
+      `  └ В работе: ${fmtWait(elapsedSec)}` +
+      (watcher.lastError ? `\n  ⚠️ Посл. ошибка: <i>${esc(watcher.lastError)}</i>` : '');
+  }
+
+  const modeLabel = sched.stop_on_detect
+    ? '🛑 Завершать после 1-й отметки'
+    : '🔁 Следить до конца окна';
+
+  const lastRunBlock =
+    sched.last_triggered_at || sched.last_status
+      ? `\n🕒 Последний результат: ${sched.last_triggered_at ? `<code>${esc(fmtDateTime(sched.last_triggered_at))}</code> · ` : ''}${esc(sched.last_status || '—')}`
+      : '';
+
+  const toggleBtn = sched.enabled
+    ? btn('⏸ Поставить на паузу', `psched_toggle:${sched.id}:${kind}`)
+    : btn('▶️ Включить слот', `psched_toggle:${sched.id}:${kind}`);
+  const modeBtn = sched.stop_on_detect
+    ? btn('🔁 Переключить: до конца окна', `psched_mode:${sched.id}:${kind}`)
+    : btn('🛑 Переключить: стоп после 1-й', `psched_mode:${sched.id}:${kind}`);
+
+  const kb = [
+    [toggleBtn],
+    [btn('👤 Сменить разведчика', `psched_scout:${sched.id}:0:${kind}`), btn('⏱ Изменить время', `psched_edit_time:${sched.id}:${kind}`)],
+    [modeBtn],
+    [btn('🔄 Обновить', `psched:${sched.id}:${kind}`), btn('🗑 Удалить слот', `psched_del:${sched.id}:${kind}`)],
+    [btn('⬅️ К слотам пула', `pscheds:${sched.pool_id}:${kind}`), btn('👑 Админка', 'admin')],
+  ];
+
+  await show(
+    ctx,
+    `⚙️ <b>Слот авто-аттенданса</b>\n\n` +
+      `📚 Пул: <b>${esc(sched.pool_name)}</b>\n` +
+      `📅 День и время: <b>${esc(DAY_FULL[sched.day_of_week])} · ${esc(formatMinute(sched.start_minute))}–${esc(formatMinute(sched.end_minute))}</b> (${esc(config.timezone)})\n` +
+      `🕒 Сейчас: <code>${esc(DAY_SHORT[now.dayOfWeek])} ${esc(now.timeLabel)}</code>\n` +
+      `Статус: ${statusLine}\n` +
+      `🔎 Разведчик: <b>${esc(fmtScoutFromSchedule(sched))}</b> (доступно в пуле: ${eligible.length})\n` +
+      `🎯 Режим: ${modeLabel}` +
+      lastRunBlock +
+      liveBlock +
+      (note ? `\n\n${note}` : ''),
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+async function renderScheduleDayPicker(ctx, poolId, kind) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+
+  const kb = [
+    [
+      btn('Пн', `psched_day:${poolId}:1:${kind}`),
+      btn('Вт', `psched_day:${poolId}:2:${kind}`),
+      btn('Ср', `psched_day:${poolId}:3:${kind}`),
+      btn('Чт', `psched_day:${poolId}:4:${kind}`),
+    ],
+    [
+      btn('Пт', `psched_day:${poolId}:5:${kind}`),
+      btn('Сб', `psched_day:${poolId}:6:${kind}`),
+      btn('Вс', `psched_day:${poolId}:7:${kind}`),
+    ],
+    [btn('❌ Отмена', `pscheds:${poolId}:${kind}`)],
+  ];
+
+  await show(
+    ctx,
+    `📅 <b>Новое расписание · Шаг 1/3</b>\n\n` +
+      `📚 Пул: <b>${esc(pool.name)}</b>\n\n` +
+      `Выберите <b>день недели</b>, когда проходит занятие:`,
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+async function renderDraftScoutPicker(ctx, draft, page = 0) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const pool = await db.getPool(draft.poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+
+  const eligible = await db.listEligibleScoutsForPool(draft.poolId);
+  const start = page * PAGE;
+  const items = eligible.slice(start, start + PAGE);
+  const hasNext = start + PAGE < eligible.length;
+
+  const kb = [[btn('🎲 Случайный участник (рекомендуется)', 'psched_draft_scout:rand')]];
+  for (const m of items) {
+    kb.push([btn(`👤 ${fmtScoutUser(m)}`, `psched_draft_scout:${m.user_id}`)]);
+  }
+  const pg = pager('psched_draft_page', page, hasNext);
+  if (pg.length) kb.push(pg);
+  kb.push([btn('❌ Отмена', `pscheds:${draft.poolId}:${draft.kind}`)]);
+
+  const hint =
+    eligible.length === 0
+      ? `\n\n⚠️ <i>В пуле пока нет участников с включённым PGE — выберите «🎲 Случайный», бот автоматически подхватит участников, когда они подключат /autoattend.</i>`
+      : `\n\nВыберите конкретного участника-разведчика или оставьте <b>🎲 Случайный</b> (при сбое бот автоматически переключится на другого):`;
+
+  await show(
+    ctx,
+    `🔎 <b>Новое расписание · Шаг 3/3</b>\n\n` +
+      `📚 Пул: <b>${esc(pool.name)}</b>\n` +
+      `📅 Окно: <b>${esc(DAY_FULL[draft.dayOfWeek])} · ${esc(formatMinute(draft.startMinute))}–${esc(formatMinute(draft.endMinute))}</b> (${esc(config.timezone)})` +
+      hint,
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+async function renderExistingScoutPicker(ctx, schedId, page, kind) {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) return alert(ctx, '😕 Слот не найден');
+
+  const eligible = await db.listEligibleScoutsForPool(sched.pool_id);
+  const start = page * PAGE;
+  const items = eligible.slice(start, start + PAGE);
+  const hasNext = start + PAGE < eligible.length;
+
+  const randMark = sched.scout_user_id == null ? '✅ ' : '';
+  const kb = [[btn(`${randMark}🎲 Случайный участник`, `psched_set_scout:${schedId}:rand:${kind}`)]];
+  for (const m of items) {
+    const sel = Number(sched.scout_user_id) === Number(m.user_id) ? '✅ ' : '';
+    kb.push([btn(`${sel}👤 ${fmtScoutUser(m)}`, `psched_set_scout:${schedId}:${m.user_id}:${kind}`)]);
+  }
+  const pg = pager(`psched_scout:${schedId}`, page, hasNext, `:${kind}`);
+  if (pg.length) kb.push(pg);
+  kb.push([btn('⬅️ Назад к слоту', `psched:${schedId}:${kind}`)]);
+
+  await show(
+    ctx,
+    `🔎 <b>Выбор разведчика</b>\n\n` +
+      `📚 Пул: <b>${esc(sched.pool_name)}</b> (${esc(formatScheduleWindow(sched))})\n` +
+      `Участников с активным PGE: <b>${eligible.length}</b>\n\n` +
+      `Выберите, через чей аккаунт бот будет каждые ${Math.round(config.poolPollIntervalMs / 1000)} сек проверять появление Check in:`,
+    Markup.inlineKeyboard(kb),
+  );
+}
+
+act(/^psched_all:(\d+)$/, (ctx) => renderAllPoolSchedules(ctx, Number(ctx.match[1])));
+act(/^psched_pick_pool:(\d+)$/, (ctx) => renderSchedulePoolPicker(ctx, Number(ctx.match[1])));
+act(/^pscheds:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  await clearState(ctx.from.id);
+  await renderPoolSchedules(ctx, Number(ctx.match[1]), ctx.match[2]);
+});
+act(/^psched:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  await clearState(ctx.from.id);
+  await renderScheduleCard(ctx, Number(ctx.match[1]), ctx.match[2]);
+});
+act(/^psched_add:(\d+):(pools|my|own|admin)$/, (ctx) =>
+  renderScheduleDayPicker(ctx, Number(ctx.match[1]), ctx.match[2]),
+);
+
+act(/^psched_day:(\d+):([1-7]):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const poolId = Number(ctx.match[1]);
+  const dayOfWeek = Number(ctx.match[2]);
+  const kind = ctx.match[3];
+  const pool = await db.getPool(poolId);
+  if (!pool) return alert(ctx, '😕 Пул не найден');
+
+  await resetDialog(ctx.from.id);
+  await setState(ctx.from.id, { type: 'psched_time', mode: 'create', poolId, dayOfWeek, kind });
+  const now = getZonedNow();
+
+  await show(
+    ctx,
+    `⏱ <b>Новое расписание · Шаг 2/3</b>\n\n` +
+      `📚 Пул: <b>${esc(pool.name)}</b>\n` +
+      `📅 День: <b>${esc(DAY_FULL[dayOfWeek])}</b>\n` +
+      `🕒 Текущее время (${esc(config.timezone)}): <code>${esc(now.timeLabel)}</code>\n\n` +
+      `Отправьте временной интервал в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>\n` +
+      `<i>Например:</i> <code>10:00-11:00</code> или <code>14:00-15:30</code> (от 5 мин до 4 часов).`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', `pscheds:${poolId}:${kind}`)]]),
+  );
+});
+
+act(/^psched_draft_page:(\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const draft = await getState(ctx.from.id);
+  if (!draft || draft.type !== 'psched_draft') {
+    return alert(ctx, '⚠️ Черновик расписания устарел. Начните заново.');
+  }
+  await renderDraftScoutPicker(ctx, draft, Number(ctx.match[1]));
+});
+
+act(/^psched_draft_scout:(rand|\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const draft = await getState(ctx.from.id);
+  if (!draft || draft.type !== 'psched_draft') {
+    return alert(ctx, '⚠️ Черновик расписания устарел. Начните заново.');
+  }
+  const scoutUserId = ctx.match[1] === 'rand' ? null : Number(ctx.match[1]);
+  const sched = await db.createPoolSchedule({
+    poolId: draft.poolId,
+    dayOfWeek: draft.dayOfWeek,
+    startMinute: draft.startMinute,
+    endMinute: draft.endMinute,
+    scoutUserId,
+    createdBy: ctx.state.user.id,
+    stopOnDetect: true,
+  });
+  await clearState(ctx.from.id);
+  void poolScheduler.syncNow();
+  await ctx.answerCbQuery('✅ Расписание создано!').catch(() => {});
+  await renderScheduleCard(ctx, sched.id, draft.kind, '✅ Расписание добавлено и активировано.');
+});
+
+act(/^psched_toggle:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) return alert(ctx, '😕 Слот не найден');
+  const updated = await db.updatePoolSchedule(schedId, { enabled: !sched.enabled });
+  poolScheduler.clearWindowExhaustion(schedId);
+  void poolScheduler.syncNow();
+  await ctx
+    .answerCbQuery(updated?.enabled ? '▶️ Слот включён' : '⏸ Слот поставлен на паузу')
+    .catch(() => {});
+  await renderScheduleCard(ctx, schedId, kind);
+});
+
+act(/^psched_mode:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) return alert(ctx, '😕 Слот не найден');
+  const updated = await db.updatePoolSchedule(schedId, { stopOnDetect: !sched.stop_on_detect });
+  void poolScheduler.syncNow();
+  await ctx
+    .answerCbQuery(
+      updated?.stop_on_detect ? '🛑 Режим: стоп после 1-й отметки' : '🔁 Режим: следить до конца окна',
+    )
+    .catch(() => {});
+  await renderScheduleCard(ctx, schedId, kind);
+});
+
+act(/^psched_scout:(\d+):(\d+):(pools|my|own|admin)$/, (ctx) =>
+  renderExistingScoutPicker(ctx, Number(ctx.match[1]), Number(ctx.match[2]), ctx.match[3]),
+);
+
+act(/^psched_set_scout:(\d+):(rand|\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const scoutUserId = ctx.match[2] === 'rand' ? null : Number(ctx.match[2]);
+  const kind = ctx.match[3];
+  await db.updatePoolSchedule(schedId, { scoutUserId });
+  poolScheduler.clearWindowExhaustion(schedId);
+  void poolScheduler.syncNow();
+  await ctx.answerCbQuery('✅ Разведчик обновлён').catch(() => {});
+  await renderScheduleCard(ctx, schedId, kind, '✅ Разведчик обновлён.');
+});
+
+act(/^psched_edit_time:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) return alert(ctx, '😕 Слот не найден');
+
+  await resetDialog(ctx.from.id);
+  await setState(ctx.from.id, { type: 'psched_time', mode: 'edit', schedId, kind });
+  const now = getZonedNow();
+
+  await show(
+    ctx,
+    `⏱ <b>Изменение времени слота</b>\n\n` +
+      `📚 Пул: <b>${esc(sched.pool_name)}</b>\n` +
+      `📅 Текущее окно: <b>${esc(DAY_FULL[sched.day_of_week])} · ${esc(formatMinute(sched.start_minute))}–${esc(formatMinute(sched.end_minute))}</b>\n` +
+      `🕒 Сейчас (${esc(config.timezone)}): <code>${esc(now.timeLabel)}</code>\n\n` +
+      `Отправьте новый интервал в формате <code>ЧЧ:ММ-ЧЧ:ММ</code> (например <code>10:00-11:00</code>):`,
+    Markup.inlineKeyboard([[btn('❌ Отмена', `psched:${schedId}:${kind}`)]]),
+  );
+});
+
+act(/^psched_del:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const sched = await db.getPoolSchedule(schedId);
+  if (!sched) return alert(ctx, '😕 Слот не найден');
+
+  await show(
+    ctx,
+    `🗑 <b>Удалить расписание?</b>\n\n` +
+      `📚 Пул: <b>${esc(sched.pool_name)}</b>\n` +
+      `📅 Окно: <b>${esc(formatScheduleWindow(sched))}</b>`,
+    Markup.inlineKeyboard([
+      [btn('🗑 Да, удалить', `psched_delok:${schedId}:${kind}`)],
+      [btn('❌ Отмена', `psched:${schedId}:${kind}`)],
+    ]),
+  );
+});
+
+act(/^psched_delok:(\d+):(pools|my|own|admin)$/, async (ctx) => {
+  if (!isAdmin(ctx.state.user)) return alert(ctx, '⛔ Только для админов');
+  const schedId = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const sched = await db.getPoolSchedule(schedId);
+  await db.deletePoolSchedule(schedId);
+  poolScheduler.clearWindowExhaustion(schedId);
+  void poolScheduler.syncNow();
+  await ctx.answerCbQuery('🗑 Расписание удалено').catch(() => {});
+  if (sched && kind !== 'admin') {
+    await renderPoolSchedules(ctx, sched.pool_id, kind, '🗑 Слот удалён.');
+  } else {
+    await renderAllPoolSchedules(ctx, 0);
+  }
 });
 
 // ---------- текстовый ввод ----------
@@ -2464,6 +3151,45 @@ bot.on('text', async (ctx) => {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([[btn('🛡 Модераторы', 'mods:0')], [btn('👑 Админ-панель', 'admin')]]),
     });
+    return;
+  }
+
+  if (state.type === 'psched_time') {
+    if (!isAdmin(u)) return clearState(u.id);
+    const parsed = parseTimeRange(text);
+    if (!parsed.ok) {
+      const cancelTarget =
+        state.mode === 'edit' ? `psched:${state.schedId}:${state.kind}` : `pscheds:${state.poolId}:${state.kind}`;
+      return ctx.reply(`⚠️ ${parsed.error}\nПопробуйте ещё раз или нажмите «Отмена».`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[btn('❌ Отмена', cancelTarget)]]),
+      });
+    }
+
+    if (state.mode === 'edit') {
+      const updated = await db.updatePoolSchedule(state.schedId, {
+        startMinute: parsed.startMinute,
+        endMinute: parsed.endMinute,
+      });
+      await clearState(u.id);
+      if (!updated) {
+        return ctx.reply('😕 Слот не найден — возможно, его удалили.');
+      }
+      poolScheduler.clearWindowExhaustion(state.schedId);
+      void poolScheduler.syncNow();
+      return renderScheduleCard(ctx, state.schedId, state.kind, '✅ Время слота обновлено.');
+    }
+
+    const draft = {
+      type: 'psched_draft',
+      poolId: state.poolId,
+      dayOfWeek: state.dayOfWeek,
+      startMinute: parsed.startMinute,
+      endMinute: parsed.endMinute,
+      kind: state.kind,
+    };
+    await setState(u.id, draft);
+    return renderDraftScoutPicker(ctx, draft, 0);
   }
 });
 
@@ -2473,6 +3199,7 @@ bot.catch((err, ctx) => {
 });
 
 export async function shutdown() {
+  await poolScheduler.stop().catch(() => {});
   await aw.stopAllSessions().catch(() => {});
   await aa.shutdownAttendance().catch(() => {});
   await redis.quit().catch(() => {});

@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { initDb, ensureEnvAdmins } from './db.js';
-import { bot, shutdown, setBotUsername } from './bot.js';
+import { bot, shutdown, setBotUsername, startPoolScheduler } from './bot.js';
 
 await initDb();
 
@@ -42,6 +42,10 @@ await bot.telegram
   .catch(() => {});
 
 bot.launch();
+startPoolScheduler();
+console.log(
+  `⏰ Планировщик авто-аттенданса пулов запущен (TZ: ${config.timezone}, интервал: ${Math.round(config.poolPollIntervalMs / 1000)}с, лимит наблюдателей: ${config.maxPoolWatchers})`,
+);
 
 const stop = async (signal) => {
   bot.stop(signal);

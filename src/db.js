@@ -39,6 +39,24 @@ export async function initDb() {
       last_status     TEXT,
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS pool_schedules (
+      id                SERIAL PRIMARY KEY,
+      pool_id           INT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+      day_of_week       SMALLINT NOT NULL CHECK (day_of_week BETWEEN 1 AND 7),
+      start_minute      SMALLINT NOT NULL CHECK (start_minute BETWEEN 0 AND 1439),
+      end_minute        SMALLINT NOT NULL CHECK (end_minute BETWEEN 1 AND 1440 AND end_minute > start_minute),
+      scout_user_id     BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      enabled           BOOLEAN NOT NULL DEFAULT true,
+      stop_on_detect    BOOLEAN NOT NULL DEFAULT true,
+      created_by        BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      last_window_key   TEXT,
+      last_triggered_at TIMESTAMPTZ,
+      last_status       TEXT,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS pool_schedules_pool_idx ON pool_schedules (pool_id);
+    CREATE INDEX IF NOT EXISTS pool_schedules_active_idx ON pool_schedules (enabled, day_of_week);
   `);
 }
 
@@ -93,6 +111,11 @@ export async function listModerators(limit, offset) {
   return rows;
 }
 
+export async function listAdminIds() {
+  const { rows } = await q(`SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC`);
+  return rows.map((r) => r.id);
+}
+
 export async function countUsers() {
   const { rows } = await q(`SELECT count(*) AS c FROM users`);
   return Number(rows[0]?.c ?? 0);
@@ -117,7 +140,9 @@ export async function stats() {
       (SELECT count(*) FROM pools) AS pools,
       (SELECT count(*) FROM pool_members) AS memberships,
       (SELECT count(*) FROM auto_attendance) AS auto_attendance_total,
-      (SELECT count(*) FROM auto_attendance WHERE enabled = true) AS auto_attendance_enabled
+      (SELECT count(*) FROM auto_attendance WHERE enabled = true) AS auto_attendance_enabled,
+      (SELECT count(*) FROM pool_schedules) AS pool_schedules_total,
+      (SELECT count(*) FROM pool_schedules WHERE enabled = true) AS pool_schedules_enabled
   `);
   return rows[0];
 }
@@ -289,6 +314,146 @@ export async function getAutoAttendanceForUsers(userIds) {
        FROM auto_attendance
       WHERE user_id = ANY($1::bigint[])`,
     [userIds],
+  );
+  return rows;
+}
+
+// ---------- pool_schedules ----------
+const SCHEDULE_SELECT = `
+  SELECT s.*,
+         p.name AS pool_name,
+         u.username AS scout_username,
+         u.first_name AS scout_first_name,
+         aa.login_mask AS scout_login_mask,
+         aa.enabled AS scout_aa_enabled
+    FROM pool_schedules s
+    JOIN pools p ON p.id = s.pool_id
+    LEFT JOIN users u ON u.id = s.scout_user_id
+    LEFT JOIN auto_attendance aa ON aa.user_id = s.scout_user_id
+`;
+
+export async function createPoolSchedule({
+  poolId,
+  dayOfWeek,
+  startMinute,
+  endMinute,
+  scoutUserId = null,
+  createdBy = null,
+  stopOnDetect = true,
+}) {
+  const { rows } = await q(
+    `INSERT INTO pool_schedules
+       (pool_id, day_of_week, start_minute, end_minute, scout_user_id, created_by, stop_on_detect)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id`,
+    [poolId, dayOfWeek, startMinute, endMinute, scoutUserId ?? null, createdBy ?? null, Boolean(stopOnDetect)],
+  );
+  return getPoolSchedule(rows[0].id);
+}
+
+export async function getPoolSchedule(id) {
+  const { rows } = await q(`${SCHEDULE_SELECT} WHERE s.id = $1`, [id]);
+  return rows[0] || null;
+}
+
+export async function listPoolSchedules(poolId) {
+  const { rows } = await q(
+    `${SCHEDULE_SELECT}
+      WHERE s.pool_id = $1
+      ORDER BY s.day_of_week ASC, s.start_minute ASC, s.id ASC`,
+    [poolId],
+  );
+  return rows;
+}
+
+export async function listAllPoolSchedules(limit, offset) {
+  const { rows } = await q(
+    `${SCHEDULE_SELECT}
+      ORDER BY s.enabled DESC, s.day_of_week ASC, s.start_minute ASC, s.id ASC
+      LIMIT $1 OFFSET $2`,
+    [limit, offset],
+  );
+  return rows;
+}
+
+export async function countPoolSchedules() {
+  const { rows } = await q(`SELECT count(*) AS c FROM pool_schedules`);
+  return Number(rows[0]?.c ?? 0);
+}
+
+export async function listEnabledPoolSchedules() {
+  const { rows } = await q(
+    `${SCHEDULE_SELECT}
+      WHERE s.enabled = true
+      ORDER BY s.day_of_week ASC, s.start_minute ASC, s.id ASC`,
+  );
+  return rows;
+}
+
+export async function updatePoolSchedule(id, fields) {
+  const sets = [];
+  const params = [id];
+  const push = (col, val) => {
+    params.push(val);
+    sets.push(`${col} = $${params.length}`);
+  };
+
+  if (Object.prototype.hasOwnProperty.call(fields, 'enabled')) push('enabled', Boolean(fields.enabled));
+  if (Object.prototype.hasOwnProperty.call(fields, 'scoutUserId')) push('scout_user_id', fields.scoutUserId ?? null);
+  if (Object.prototype.hasOwnProperty.call(fields, 'stopOnDetect')) push('stop_on_detect', Boolean(fields.stopOnDetect));
+  if (Object.prototype.hasOwnProperty.call(fields, 'dayOfWeek')) push('day_of_week', Number(fields.dayOfWeek));
+  if (Object.prototype.hasOwnProperty.call(fields, 'startMinute')) push('start_minute', Number(fields.startMinute));
+  if (Object.prototype.hasOwnProperty.call(fields, 'endMinute')) push('end_minute', Number(fields.endMinute));
+
+  if (sets.length === 0) return getPoolSchedule(id);
+
+  sets.push('updated_at = now()');
+  const r = await q(`UPDATE pool_schedules SET ${sets.join(', ')} WHERE id = $1`, params);
+  if (r.rowCount === 0) return null;
+  return getPoolSchedule(id);
+}
+
+export async function markPoolScheduleTriggered(id, windowKey, statusText) {
+  await q(
+    `UPDATE pool_schedules
+        SET last_window_key = $2,
+            last_triggered_at = now(),
+            last_status = $3,
+            updated_at = now()
+      WHERE id = $1`,
+    [id, windowKey, statusText],
+  );
+}
+
+export async function updatePoolScheduleStatus(id, statusText) {
+  await q(
+    `UPDATE pool_schedules
+        SET last_status = $2,
+            updated_at = now()
+      WHERE id = $1`,
+    [id, statusText],
+  );
+}
+
+export async function deletePoolSchedule(id) {
+  const r = await q('DELETE FROM pool_schedules WHERE id = $1', [id]);
+  return r.rowCount > 0;
+}
+
+export async function listEligibleScoutsForPool(poolId) {
+  const { rows } = await q(
+    `SELECT u.id AS user_id,
+            u.username,
+            u.first_name,
+            aa.login_mask,
+            aa.enc_credentials
+       FROM pool_members m
+       JOIN users u ON u.id = m.user_id
+       JOIN auto_attendance aa ON aa.user_id = m.user_id
+      WHERE m.pool_id = $1
+        AND aa.enabled = true
+      ORDER BY m.joined_at ASC`,
+    [poolId],
   );
   return rows;
 }
